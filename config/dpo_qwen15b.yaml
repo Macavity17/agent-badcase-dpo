@@ -1,0 +1,59 @@
+# LLaMA-Factory DPO 配置（Qwen2.5-1.5B-Instruct，单卡 4090D 可跑）
+# 用法: llamafactory-cli train config/dpo_qwen15b.yaml
+# 注意: dataset 名要和 data/lf_data/dataset_info.json 里注册的名字一致
+
+### model
+model_name_or_path: ./models/Qwen2.5-1.5B-Instruct
+trust_remote_code: true
+
+### method
+stage: dpo
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: all
+pref_beta: 0.1          # DPO 温度：越大越保守（偏离基座越少）。效果差先调小到 0.05
+pref_loss: sigmoid      # sigmoid=DPO；也可试 hinge / ipo / kto_pair
+
+### dataset
+dataset: agent_pref     # ← 对应 dataset_info.json 里的 key
+template: qwen
+cutoff_len: 2048        # agent 轨迹较长，必要时调到 4096
+max_samples: 2000
+overwrite_cache: true
+preprocessing_num_workers: 8
+
+### output
+output_dir: ./outputs/dpo-qwen15b
+logging_steps: 5
+save_steps: 100
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-6
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+gradient_checkpointing: true
+
+### eval
+val_size: 0.05
+per_device_eval_batch_size: 2
+eval_strategy: steps
+eval_steps: 50
+load_best_model_at_end: true
+
+# —— 合并 LoRA 权重用的 export 配置（merge_lora.yaml）——
+# model_name_or_path: ./models/Qwen2.5-1.5B-Instruct
+# adapter_name_or_path: ./outputs/dpo-qwen15b
+# template: qwen
+# finetuning_type: lora
+# export_dir: ./outputs/dpo_merged
+# export_size: 4
+# export_legacy_format: false

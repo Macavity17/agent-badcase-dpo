@@ -1,0 +1,31 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ---- 模型与下载缓存 ----
+models/
+.cache/
+
+# ---- 实验产物（跑完后手动备份，不进 git）----
+data/
+results/
+runs/
+outputs/
+
+# ---- 日志 ----
+*.log
+nohup.out
+vllm.log
+
+# ---- 敏感信息 ----
+.env
+*.token
+credentials*
+
+# ---- 系统/编辑器 ----
+.DS_Store

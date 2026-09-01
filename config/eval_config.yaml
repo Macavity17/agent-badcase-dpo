@@ -1,0 +1,37 @@
+# 评测配置：前后对比用什么口径衡量（这块是你的强项，值得多花时间）
+
+# ---- 1. 任务完成率（规则判定，主指标）----
+completion:
+  checker_types: [tool_call, final_contains, final_not_contains]
+  # tool_call:          期望最终调用了某工具且参数命中
+  # final_contains:     最终答案必须包含某关键词（用于检验约束是否被遵守）
+  # final_not_contains: 最终答案不得包含（如给海鲜过敏用户推荐了海鲜）
+
+# ---- 2. LLM-as-a-judge（轨迹质量，副指标）----
+judge:
+  model: deepseek-chat          # 强模型，走环境变量 OPENAI_API_KEY / OPENAI_BASE_URL
+  samples: 3                    # 每条轨迹采样 3 次取均值，降低单次抖动
+  temperature: 0.2
+  rubric:
+    - key: tool_selection
+      desc: 工具选择是否正确（选对工具、参数合理）
+      min: 1
+      max: 5
+    - key: constraint_adherence
+      desc: 是否遵守任务中给出的约束（预算/禁忌/格式等）
+      min: 1
+      max: 5
+    - key: step_efficiency
+      desc: 步骤是否高效（无冗余调用、无重复动作、无明显跑偏）
+      min: 1
+      max: 5
+
+# ---- 3. 分类别统计（按三类失败模式拆，最贴岗位课题）----
+failure_modes: [tool_misuse, context_forgetting, planning_drift]
+
+# ---- 4. 报告 ----
+report:
+  out: results/compare.md
+  # 除了总表，还要输出：每个失败模式的 before→after、judge 各维度的 before→after
+  breakdown_by_mode: true
+  breakdown_by_rubric: true

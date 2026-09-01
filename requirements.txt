@@ -1,0 +1,16 @@
+# 推理与评测（AutoDL 基础镜像一般自带 torch/cuda，这里列关键项）
+openai>=1.40          # 连 vLLM 的 OpenAI 兼容服务（跑基线/合成数据/评测都用它）
+vllm>=0.6.0           # 起本地推理服务，快
+transformers>=4.44
+torch>=2.3
+
+# 数据与评测
+pandas>=2.0
+numpy>=1.26
+tqdm>=4.66
+tenacity>=8.3         # API 重试
+
+# 绘图（可选，画前后对比图）
+matplotlib>=3.8
+
+# 训练部分装在 LLaMA-Factory 里，见 QUICKSTART.md 第 11 步
