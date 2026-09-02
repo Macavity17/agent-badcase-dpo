@@ -17,6 +17,9 @@ results/
 runs/
 outputs/
 
+# ---- 服务器本地训练依赖 ----
+vendor/
+
 # ---- 日志 ----
 *.log
 nohup.out

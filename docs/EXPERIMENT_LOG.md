@@ -1486,3 +1486,14 @@ scp -P 24138 /tmp/agent-badcase-dpo-c1cd94d.bundle root@connect.cqa1.seetacloud.
 服务器随后成功验证 bundle、以 Git fetch 更新 `origin/main`、通过 `git fsck --connectivity-only origin/main`，并 `git merge --ff-only origin/main`。最终结果：服务器 HEAD 和 `origin/main` 都是 `c1cd94d56c5b89ac9b1537a9bf99f382c8567b36`；工作区仍仅有 `?? vendor/`。快进带来第二轮配置、teacher、holdout、评测器、测试和文档；未触及任何被 Git 忽略的第一轮模型或实验产物。临时 bundle 暂保留在服务器 `/root/autodl-tmp/agent-badcase-dpo-c1cd94d.bundle`，未删除。
 
 本轮没有运行训练、服务、模型推理、数据重建或 GPU 命令。
+
+## 2026-09-03 / Run 19：忽略服务器本地 LLaMA-Factory 依赖目录
+
+服务器 `git status --short` 曾稳定显示 `?? vendor/`。该目录是服务器本地的 LLaMA-Factory 源码依赖，训练需要保留它，但它不属于本项目源码、不能作为实验数据或成果提交到 GitHub。为避免未来误用 `git add .` 或 `git add -A` 将大量第三方源码加入仓库，在 `.gitignore` 新增精确规则：
+
+```gitignore
+# ---- 服务器本地训练依赖 ----
+vendor/
+```
+
+该改动只改变 Git 是否报告/暂存该目录：不会删除或修改服务器 `vendor/LLaMA-Factory`，不会改变基座模型、第一轮或第二轮输出，也不会影响训练时通过该目录调用 LLaMA-Factory。后续服务器同步后，`git status --short` 应不再显示 `vendor/`。
