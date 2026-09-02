@@ -1798,3 +1798,47 @@ git pull --ff-only origin main
 ```bash
 git pull --ff-only origin main
 ```
+
+## 2026-09-03 / Run 22：README 论文式完整报告
+
+### 目标
+
+将原本偏项目首页的 README 扩展为一份可独立阅读的完整实验报告，让读者不必先翻阅其他文档，即可理解研究动机、两轮实验、评测边界、负结果及其产品含义。
+
+### 文档变更
+
+`README.md` 从 185 行扩展到 402 行，新报告包含：
+
+- 摘要、关键词、问题背景和真实性边界；
+- RQ1-RQ3 与对应假设；
+- 合成慢病照护应用环境、三类失效和模型/训练环境；
+- 任务、scenario family、eval task 和两份 holdout 的隔离口径；
+- `full` / `window` / `layered` 上下文策略结果；
+- 第一轮整轨迹 DPO 的数据、训练、holdout 退化与轨迹归因；
+- 第二轮 teacher-v2 状态动作 DPO 的数据重构、三级评测、OOM 修复和负迁移结果；
+- reward、自由 next action 与端到端完成率三者不等价的综合讨论；
+- 第二轮的边际归因价值、Agent 产品启示、局限、后续实验和复现索引。
+
+报告保留以下证据边界：本项目是受既往慢病照护 Agent 实践启发、在离岗后独立完成的合成受控 pilot；不是九安医疗或腾讯内部项目，不包含真实患者数据，也不宣称 DPO 带来了端到端 uplift。第二轮被明确定位为“归因加固实验”，而非效果提升实验。
+
+### 本地校验命令
+
+```bash
+wc -l README.md docs/EXPERIMENT_LOG.md
+git diff --stat
+git diff --check
+rg -n "九安|Andon|生产|线上|部署|显著|证明|强模型|人工|患者数据|真实数据|提升|改善|有效" README.md
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m unittest discover -s tests -v
+python3 scripts/0_validate_tasks.py
+python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
+git diff --check
+```
+
+### 校验结果
+
+- `README.md` 为 402 行；文档中引用的仓库路径全部存在。
+- 18 个单元测试全部通过，运行时间 0.009 s。
+- 24 条主任务校验通过：15 train / 9 test，三类失效各 8 条，每类 5 train / 3 test。
+- 9 条 `holdout_v2` 校验通过：三类失效各 3 条。
+- `git diff --check` 无输出，未发现空白符错误。
+- 本轮没有连接 AutoDL、没有执行任何服务器命令、没有重跑模型或实验，也没有改动数据集、checker 或任何历史结果。
