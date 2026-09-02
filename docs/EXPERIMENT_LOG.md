@@ -1276,6 +1276,43 @@ git pull --ff-only origin main
 git pull --ff-only origin main
 ```
 
+## 2026-09-03 / Run 21：两轮证据下载、校验与解压
+
+用户授权直接在 Mac 操作后，通过交互式 SFTP 将两轮轻量证据包下载到 `/Users/paxon/Downloads/care-agent-evidence/`。密码仅在 SFTP 交互提示中输入，未写入命令、文件或日志。
+
+本地命令与 SFTP 子命令：
+
+```bash
+mkdir -p /Users/paxon/Downloads/care-agent-evidence
+sftp -P 24138 root@connect.cqa1.seetacloud.com
+get /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+get /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz
+bye
+shasum -a 256 care-agent-evidence-20260903.tar.gz care-agent-evidence-round2-20260903.tar.gz
+ls -la
+mkdir -p /Users/paxon/Downloads/care-agent-evidence/round1 /Users/paxon/Downloads/care-agent-evidence/round2
+tar -xzf /Users/paxon/Downloads/care-agent-evidence/care-agent-evidence-20260903.tar.gz -C /Users/paxon/Downloads/care-agent-evidence/round1
+tar -xzf /Users/paxon/Downloads/care-agent-evidence/care-agent-evidence-round2-20260903.tar.gz -C /Users/paxon/Downloads/care-agent-evidence/round2
+du -sh /Users/paxon/Downloads/care-agent-evidence/round1 /Users/paxon/Downloads/care-agent-evidence/round2
+find /Users/paxon/Downloads/care-agent-evidence/round1 -type f | wc -l
+find /Users/paxon/Downloads/care-agent-evidence/round2 -type f | wc -l
+```
+
+校验结果：
+
+```text
+e9ad0708ce2b2764053aa0a37e598fd4c5ccc0d08d8a9bf2dae109a6dfc88347  care-agent-evidence-20260903.tar.gz
+590974ca8bad782eb957b10c06e40f44429c96b02750a4016ab34f534408483c  care-agent-evidence-round2-20260903.tar.gz
+```
+
+两个哈希均与服务器归档时记录一致。解压后第一轮目录约 2.6 MB、44 个文件；第二轮目录约 2.1 MB、47 个文件。原始压缩包和两个独立解压目录均保留，没有相互覆盖。证据已落盘 Mac，不再仅依赖 AutoDL 实例盘。
+
+本小节提交并推送后，为保持服务器代码与 GitHub 对齐，服务器只再执行下面这一条预登记命令，之后不再执行其他服务器 shell 命令：
+
+```bash
+git pull --ff-only origin main
+```
+
 第一次返回 `curl 16 Error in the HTTP2 framing layer`；第二次超过 90 秒无输出，手动 `Ctrl+C` 中断。没有执行第二轮数据构造或训练。
 
 本轮为确认固定在服务器的 LLaMA-Factory `0.9.6.dev0` 是否真正支持多轮工具偏好与显式 eval dataset，只读执行了以下全部 shell 命令：
