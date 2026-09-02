@@ -28,6 +28,7 @@
 ## Checker
 
 - `tool_call`：调用指定工具，参数包含预期键值。
+- `tool_arg_not_contains`：指定工具参数不得包含敏感、越权或错误文本。
 - `tool_not_called`：没有调用高风险或错误工具。
 - `tool_call_sequence`：关键工具按顺序出现，允许中间存在其他调用。
 - `max_tool_calls`：限制冗余调用。

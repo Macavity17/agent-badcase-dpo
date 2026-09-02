@@ -391,6 +391,69 @@ scp -P <SSH_PORT> \
 
 项目必须描述为“受慢病照护 Agent 实践启发、离岗后独立完成的合成受控实验”，不能写成九安内部训练或生产部署。
 
+## 15. 第二轮 state-action 数据与新盲测集
+
+第一轮结果收口后新增的第二轮数据不得覆盖 v1 文件。先构造并导出：
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+/root/miniconda3/envs/care-infer/bin/python scripts/6_build_teacher_v2.py \
+  --badcase data/train_badcases_labeled.jsonl \
+  --tasks tasks/tasks.jsonl \
+  --specs tasks/teacher_v2_specs.jsonl \
+  --out data/pref_pairs_teacher_v2.jsonl
+
+/root/miniconda3/envs/care-infer/bin/python scripts/4_to_llamafactory.py \
+  --pref data/pref_pairs_teacher_v2.jsonl \
+  --outdir data/lf_data_teacher_v2 \
+  --train-config config/dpo_teacher_v2.yaml
+
+/root/miniconda3/envs/care-infer/bin/python scripts/0_validate_tasks.py \
+  --tasks tasks/holdout_v2.jsonl
+```
+
+确认统计为 68 条源 badcase、98 条候选、24 条完全重复、74 条唯一训练 pair；新 holdout 为 9 条且每类 stress 3 条。详细来源与固定哈希见 `docs/DATA_CARD_TEACHER_V2.md`。
+
+第二轮必须使用独立输出路径：
+
+```bash
+nohup conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  llamafactory-cli train config/dpo_teacher_v2.yaml \
+  > runs/dpo_teacher_v2_train.log 2>&1 &
+echo $! > runs/dpo_teacher_v2_train.pid
+
+tail -f runs/dpo_teacher_v2_train.log
+
+conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  llamafactory-cli export config/merge_teacher_v2.yaml \
+  > runs/merge_teacher_v2.log 2>&1
+```
+
+评测前，base 和 teacher-v2 DPO 都必须在 `tasks/holdout_v2.jsonl` 上使用相同的 `repeats=3`、`temperature=0.2`、`seed=20260904`。先运行并保存 base 结果，再运行 DPO；不要查看 base 轨迹后修改 holdout：
+
+```bash
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
+  --tasks tasks/holdout_v2.jsonl --split test --strategy full \
+  --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
+  --port 8000 --model base \
+  --out data/holdout_v2_base_full_seed20260904.jsonl --resume
+
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
+  --tasks tasks/holdout_v2.jsonl --split test --strategy full \
+  --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
+  --port 8001 --model dpo-teacher-v2 \
+  --out data/holdout_v2_dpo_full_seed20260904.jsonl --resume
+
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py \
+  --before data/holdout_v2_base_full_seed20260904.jsonl \
+  --after data/holdout_v2_dpo_full_seed20260904.jsonl \
+  --out results/dpo_teacher_v2_compare_seed20260904.md
+```
+
+本节只定义预注册执行条件，不代表第二轮已经训练或取得提升。
+
 ## 截止日前止损顺序
 
 可以砍：LLM judge、图表、summary 策略、额外 seed、公开 benchmark、超参搜索。

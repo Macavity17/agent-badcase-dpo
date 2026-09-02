@@ -10,7 +10,7 @@ from utils import load_jsonl
 
 
 CHECKER_TYPES = {
-    "tool_call", "tool_not_called", "tool_call_sequence", "max_tool_calls",
+    "tool_call", "tool_arg_not_contains", "tool_not_called", "tool_call_sequence", "max_tool_calls",
     "final_contains", "final_contains_any", "final_contains_all",
     "final_not_contains", "all", "any",
 }
@@ -59,6 +59,18 @@ def validate_task(task):
             unexpected = set((check.get("expect_args_contains") or {}).keys()) - declared
             if unexpected:
                 errors.append(f"checker 参数不在 {tool.get('name')} schema 中：{sorted(unexpected)}")
+        if ctype == "tool_arg_not_contains":
+            expect_tool = check.get("expect_tool")
+            if expect_tool not in names:
+                errors.append(f"checker 引用了不存在的工具 {expect_tool}")
+            else:
+                tool = next(t for t in tools if t.get("name") == expect_tool)
+                if check.get("arg") not in (tool.get("args") or {}):
+                    errors.append(
+                        f"checker 参数不在 {expect_tool} schema 中：{check.get('arg')}"
+                    )
+            if not check.get("values"):
+                errors.append("tool_arg_not_contains 缺少 values")
         if ctype in {"tool_not_called", "tool_call_sequence"}:
             missing = [name for name in (check.get("tools") or []) if name not in names]
             if missing:

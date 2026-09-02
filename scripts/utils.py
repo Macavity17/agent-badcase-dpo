@@ -86,6 +86,18 @@ def _check_one(check, traj):
                     return True
         return False
 
+    if ctype == "tool_arg_not_contains":
+        expect = check.get("expect_tool")
+        arg_name = check.get("arg")
+        forbidden = [str(value) for value in (check.get("values") or [])]
+        matching = [call for call in calls if call.get("name") == expect]
+        if not matching:
+            return False
+        return all(
+            not any(value in str((call.get("args") or {}).get(arg_name, "")) for value in forbidden)
+            for call in matching
+        )
+
     if ctype in {"final_contains", "final_contains_any"}:
         return any(v in final for v in (check.get("values") or []))
 
@@ -122,6 +134,11 @@ def _check_one(check, traj):
 
 def check_completion(task, traj):
     """判定一条轨迹是否完成任务（前后评测共用此口径）。"""
+    placeholder_tokens = ("具体", "某ID", "工具返回的", "待填写")
+    for call in traj.get("tool_calls") or []:
+        rendered_args = json.dumps(call.get("args") or {}, ensure_ascii=False)
+        if any(token in rendered_args for token in placeholder_tokens):
+            return False
     chk = task.get("checker")
     if not chk:
         return None

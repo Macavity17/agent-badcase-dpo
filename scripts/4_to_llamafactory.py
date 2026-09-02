@@ -31,6 +31,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pref", default="data/pref_pairs.jsonl")
     ap.add_argument("--outdir", default="data/lf_data")
+    ap.add_argument("--train-config", default="config/dpo_qwen15b.yaml")
     args = ap.parse_args()
 
     pairs = load_jsonl(args.pref)
@@ -84,8 +85,7 @@ def main():
     print(f"训练数据 {len(rows)} 条（原 {len(pairs)} 条，已过滤空值与相同的 chosen/rejected）")
     print("分类别分布：", dict(dist))
     print(f"\n已写入：\n  {out_path}\n  {info_path}\n  {stat_path}")
-    print(f"\n下一步：把 {DATASET_NAME}.json 和 dataset_info.json 拷进 LLaMA-Factory 的 data/ 目录，"
-          f"然后 llamafactory-cli train config/dpo_qwen15b.yaml")
+    print(f"\n下一步：llamafactory-cli train {args.train_config}")
 
 
 if __name__ == "__main__":

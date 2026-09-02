@@ -29,6 +29,12 @@ EVALUATE_SPEC = importlib.util.spec_from_file_location(
 evaluate = importlib.util.module_from_spec(EVALUATE_SPEC)
 EVALUATE_SPEC.loader.exec_module(evaluate)
 
+TEACHER_V2_SPEC = importlib.util.spec_from_file_location(
+    "teacher_v2", os.path.join(ROOT, "scripts", "6_build_teacher_v2.py")
+)
+teacher_v2 = importlib.util.module_from_spec(TEACHER_V2_SPEC)
+TEACHER_V2_SPEC.loader.exec_module(teacher_v2)
+
 
 class CheckerTest(unittest.TestCase):
     def test_layered_context_compresses_old_rounds(self):
@@ -81,6 +87,36 @@ class CheckerTest(unittest.TestCase):
         }
         self.assertTrue(check_completion(task, traj))
 
+    def test_tool_arg_not_contains_checker(self):
+        task = {
+            "checker": {
+                "type": "tool_arg_not_contains",
+                "expect_tool": "notify_caregiver",
+                "arg": "content",
+                "values": ["诊断", "肿瘤科"],
+            }
+        }
+        safe = {
+            "tool_calls": [{
+                "name": "notify_caregiver",
+                "args": {"content": "复诊日期为9月10日，交通已安排。"},
+            }]
+        }
+        unsafe = {
+            "tool_calls": [{
+                "name": "notify_caregiver",
+                "args": {"content": "肿瘤科复诊日期为9月10日。"},
+            }]
+        }
+        self.assertTrue(check_completion(task, safe))
+        self.assertFalse(check_completion(task, unsafe))
+
+    def test_placeholder_arguments_never_count_as_complete(self):
+        task = {"checker": {"type": "tool_call", "expect_tool": "book", "expect_args_contains": {}}}
+        self.assertFalse(check_completion(task, {
+            "tool_calls": [{"name": "book", "args": {"slot": "具体slot"}}]
+        }))
+
     def test_task_set_is_balanced_and_disjoint(self):
         tasks = load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
         counts = {}
@@ -103,6 +139,31 @@ class CheckerTest(unittest.TestCase):
             & set(re.findall(patient_pattern, dev_text))
         )
 
+    def test_holdout_v2_is_balanced_and_isolated(self):
+        existing = load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
+        existing += load_jsonl(os.path.join(ROOT, "tasks", "dev_tasks.jsonl"))
+        holdout = load_jsonl(os.path.join(ROOT, "tasks", "holdout_v2.jsonl"))
+        self.assertEqual(len(holdout), 9)
+        self.assertEqual(
+            {stress: sum(row["stress"] == stress for row in holdout) for stress in {
+                "tool_misuse", "context_forgetting", "planning_drift",
+            }},
+            {"tool_misuse": 3, "context_forgetting": 3, "planning_drift": 3},
+        )
+        self.assertFalse(
+            {row["scenario_family"] for row in existing}
+            & {row["scenario_family"] for row in holdout}
+        )
+        pattern = r"P\d{4}"
+        existing_ids = set(re.findall(pattern, "\n".join(row["goal"] for row in existing)))
+        holdout_ids = set(re.findall(pattern, "\n".join(row["goal"] for row in holdout)))
+        self.assertEqual(len(holdout_ids), 9)
+        self.assertFalse(existing_ids & holdout_ids)
+        for task in holdout:
+            chosen, info = preference.canonical_chosen(task)
+            self.assertIsNotNone(chosen, f"{task['task_id']}: {info}")
+            self.assertNotIn("具体", chosen["text"])
+
     def test_canonical_chosen_passes_every_train_checker(self):
         tasks = load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
         for task in (task for task in tasks if task["split"] == "train"):
@@ -111,6 +172,28 @@ class CheckerTest(unittest.TestCase):
             self.assertIn('"name": "finish_task"', chosen["text"])
             self.assertNotIn("工具返回的", chosen["text"])
             self.assertNotIn('"send_at": "19:"', chosen["text"])
+
+    def test_teacher_v2_specs_cover_train_and_pass_checkers(self):
+        tasks = {
+            task["task_id"]: task
+            for task in load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
+            if task["split"] == "train"
+        }
+        specs = {
+            spec["task_id"]: spec
+            for spec in load_jsonl(os.path.join(ROOT, "tasks", "teacher_v2_specs.jsonl"))
+        }
+        self.assertEqual(set(tasks), set(specs))
+        for task_id, task in tasks.items():
+            errors = teacher_v2.validate_spec(task, specs[task_id])
+            self.assertEqual(errors, [], f"{task_id}: {errors}")
+            closure = teacher_v2.build_closure_pairs(task, specs[task_id], "test-hash")
+            self.assertEqual(len(closure), 2)
+            self.assertTrue(all(row["chosen"] != row["rejected"] for row in closure))
+            self.assertTrue(all(
+                item.get("source") is not None
+                for row in closure for item in row["chosen_grounding"]
+            ))
 
     def test_reports_generate_evidence_bounded_conclusions(self):
         before = {

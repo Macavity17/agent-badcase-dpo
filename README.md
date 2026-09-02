@@ -149,6 +149,12 @@ python3 scripts/5_evaluate.py \
 
 DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训练内 eval reward accuracy 为 1.0、reward margin 为 0.217，但这种偏好分离没有转化为任务收益：训练任务上 base/DPO 都为 22/90，冻结 holdout 则从 4/27 降至 2/27。对齐轨迹显示两类退化：精确参数复用变成语义改写（如 `2` -> `连续两天`、`next_week` -> `next`），以及最终答复漏掉工具返回 ID。也观察到一个局部改善：DPO 在一条设备轨迹中避免了 base 的禁止同步调用，但仍未使该轨迹通过 checker。这说明“工具协议 0 错误”并不等于“工作流完成”，也为下一轮数据标准提供了明确方向：对 schema 值域、观测引用和结果回传分别设置评测与训练信号。
 
+### 第二轮数据修复（已准备，尚未训练）
+
+针对第一轮暴露的训练/运行协议错位，第二轮不再把整条多工具轨迹放进单个 assistant response，而是把 68 条 train badcase 编译成首次分歧点的“状态 -> 一个下一动作”偏好。去除自由文本措辞伪差异和 24 条完全重复候选后，得到 44 条真实 badcase 决策 pair；另加入 30 条结果回传 hard negative，共 74 条唯一训练 pair（工具动作 38、最终答复 36）。
+
+同时新建了 9 条未运行的 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。当前只完成数据构造与结构校验，没有第二轮训练结果。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
+
 ## 局限
 
 - 24 条任务仍是小规模合成 pilot，结论只能解释当前受控环境。

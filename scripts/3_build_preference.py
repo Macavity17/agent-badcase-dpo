@@ -190,6 +190,11 @@ def canonical_arg(task, tool_name, arg_name, expected):
         ids = find_mock_values(mocks, "id")
         if ids:
             return ",".join(ids)
+    if arg_name in {"task_id_a", "task_id_b"}:
+        task_ids = re.findall(r"T-[A-Z0-9-]+", goal)
+        offset = 0 if arg_name == "task_id_a" else 1
+        if len(task_ids) > offset:
+            return task_ids[offset]
     patterns = {
         "patient_id": r"P\d{4}",
         "measurement_id": r"BG-[A-Z0-9-]+",
@@ -212,7 +217,8 @@ def canonical_arg(task, tool_name, arg_name, expected):
     quoted = re.findall(r"[“\"]([^”\"]+)[”\"]", goal)
     defaults = {
         "days": "7", "hours": "24", "within_minutes": "60",
-        "within_hours": "24", "week": "本周", "date": "明天",
+        "within_hours": "24", "within_days": "2", "week": "本周",
+        "date": "明天", "date_range": "下周",
         "time": time_match.group(0) if time_match else "15:00",
         "send_at": "19:30", "start_at": "2026-09-04 22:30",
         "title": quoted[0] if quoted else "照护提醒",
