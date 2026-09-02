@@ -428,13 +428,18 @@ echo $! > runs/round2/dpo_train.pid
 
 tail -f runs/round2/dpo_train.log
 
+grep -E "eval_loss|rewards/accuracies|rewards/margins|rewards/chosen|rewards/rejected" \
+  runs/round2/dpo_train.log
+
 conda run --no-capture-output \
   -p /root/autodl-tmp/envs/care-train \
   llamafactory-cli export config/merge_teacher_v2.yaml \
   > runs/round2/merge.log 2>&1
 ```
 
-评测前，base 和 teacher-v2 DPO 都必须在 `tasks/holdout_v2.jsonl` 上使用相同的 `repeats=3`、`temperature=0.2`、`seed=20260904`。先运行并保存 base 结果，再运行 DPO；不要查看 base 轨迹后修改 holdout：
+评测分三层：训练日志中的 reward 指标、task-grouped eval state 上的自由下一动作、全新 holdout-v2 上的完整轨迹。状态层必须使用 `tool_choice=auto`，脚本不会按 gold 强制 tool/none；否则只是在测试参数填充。base 和 teacher-v2 DPO 的输入、pair ID 与 seed 必须对齐。
+
+端到端层必须在 `tasks/holdout_v2.jsonl` 上使用相同的 `repeats=3`、`temperature=0.2`、`seed=20260904`。先让 8000 端口的 base 服务连续完成状态与 holdout 两种评测并保存结果，再停止 base、启动 DPO，在 8001 端口按同序执行。不要查看 base 轨迹后修改 eval pair、holdout 或 checker：
 
 ```bash
 /root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
@@ -442,6 +447,15 @@ conda run --no-capture-output \
   --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
   --port 8000 --model base \
   --out data/round2/holdout_base_full_seed20260904.jsonl --resume
+
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py \
+  --pairs data/round2/pref_pairs.jsonl \
+  --tasks tasks/tasks.jsonl --split eval \
+  --port 8000 --model base --temperature 0 --seed 20260904 \
+  --out data/round2/state_eval_base.jsonl --resume
+
+sed -n '1,220p' data/round2/state_eval_base.summary.json
+grep -n '"error": "' data/round2/state_eval_base.jsonl || true
 
 # 保存 base 结果并停止 8000 服务后，再启动第二轮合并模型。
 nohup conda run --no-capture-output \
@@ -459,11 +473,33 @@ echo $! > runs/round2/vllm_dpo.pid
   --port 8001 --model dpo-round2 \
   --out data/round2/holdout_dpo_full_seed20260904.jsonl --resume
 
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py \
+  --pairs data/round2/pref_pairs.jsonl \
+  --tasks tasks/tasks.jsonl --split eval \
+  --port 8001 --model dpo-round2 --temperature 0 --seed 20260904 \
+  --out data/round2/state_eval_dpo.jsonl --resume
+
+sed -n '1,220p' data/round2/state_eval_dpo.summary.json
+grep -n '"error": "' data/round2/state_eval_dpo.jsonl || true
+
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py \
+  --compare-before data/round2/state_eval_base.jsonl \
+  --compare-after data/round2/state_eval_dpo.jsonl \
+  --report results/round2/state_action_compare.md
+
 /root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py \
   --before data/round2/holdout_base_full_seed20260904.jsonl \
   --after data/round2/holdout_dpo_full_seed20260904.jsonl \
   --out results/round2/dpo_compare_seed20260904.md
 ```
+
+按以下顺序解释，不能跨层越级下结论：
+
+1. reward accuracy/margin 改善只说明偏好对可分；14 个 eval pair 仅来自 3 个独立任务，报告时必须同时写 pair 数和任务数。
+2. 状态 next-action 改善说明偏好可能迁移到局部决策，但该层仍来自合成 train-domain task-isolated eval，只用于归因。
+3. 只有 9-task、27-trajectory untouched holdout 的规则完成率提高，且协议、安全、精确参数复用、结果 ID 回传和各 stress 没有明显退化，才能写“出现有用的 DPO 效果”。
+
+若 reward 改善但状态层不变，记录为偏好 shortcut/过拟合候选；若状态层改善而端到端不变，记录为局部学习没有沿长轨迹传播。任何类别退化和 API error 都必须单列，API error 不混入模型准确率分母，也不能用总平均掩盖。由于只有 3 个状态 eval 任务、9 个 holdout 任务和单 seed，结论统一标为探索性。
 
 本节只定义预注册执行条件，不代表第二轮已经训练或取得提升。
 

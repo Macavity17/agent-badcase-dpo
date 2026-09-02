@@ -155,6 +155,14 @@ DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训�
 
 训练内部另按 `task_id` 固定为 52 train / 14 eval，不再随机拆分同一任务的 pair。同时新建了 9 条未运行的 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。第二轮所有派生数据、日志、模型和结果都进入独立 `round2/` 路径，不覆盖第一轮。当前没有第二轮训练结果。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
 
+第二轮预注册三层证据，不能互相替代：
+
+1. **训练偏好层**：在按任务隔离的 14 条 LLaMA-Factory eval pair 上记录 reward accuracy、chosen/rejected reward 与 margin。它只判断模型能否区分这批偏好；14 条 pair 只来自 3 个独立任务，不能当作 14 个独立任务。
+2. **状态决策层**：把相同 eval state 交给 base/DPO 自由生成一个下一动作，`tool_choice=auto`，不给“应调用工具还是最终回答”的 oracle 提示。分别检查动作类型、工具名、参数键、精确参数值、最终答复 checker 和 grounding ID。该层用于定位偏好是否迁移为局部决策能力，仍是诊断指标。
+3. **端到端层**：在从未用于训练或调参的 9-task `holdout_v2` 上，以相同 seed 各运行 27 条完整轨迹。规则完成率是主产品指标，并同时检查协议错误、工具调用、参数复用、结果 ID 回传和各 stress 退化。
+
+结论遵循预注册边界：reward 改善但状态决策不变，优先解释为偏好捷径或过拟合；状态决策改善但端到端不变，说明局部动作学习没有沿长轨迹传播；只有端到端完成率提高且协议、安全和分 stress 指标没有明显退化，才算第二轮出现有用的 DPO 效果。任一 stress 的退化必须单列，不能被总平均掩盖。由于仅 9 个独立 holdout 任务、单 seed，本轮无论正负都只作探索性证据。
+
 ## 局限
 
 - 24 条任务仍是小规模合成 pilot，结论只能解释当前受控环境。

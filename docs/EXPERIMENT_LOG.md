@@ -1359,3 +1359,74 @@ To https://github.com/Macavity17/agent-badcase-dpo.git
 ```
 
 因此第二轮的数据审阅、协议对齐、固定切分、轮次隔离和收紧后 holdout 已上传 GitHub。这次 push 不包含被 Git 忽略的 `data/round2/` 派生 JSON；它们必须在服务器上按固定命令重建并进入证据包。
+
+## 2026-09-03 / Run 17：第二轮三级评测设计与状态动作评测器
+
+### 决策背景
+
+第一轮已经证明：训练内 reward accuracy/margin 上升不等于 Agent 完成率上升。为避免第二轮再次用训练偏好分离代替产品效果，本轮预注册三层证据：
+
+1. 训练偏好层记录 task-grouped eval 的 reward accuracy、chosen/rejected reward 与 margin；
+2. 状态决策层在未进入训练的 eval task 状态上，让 base/DPO 自由生成一个下一动作；
+3. 端到端层在未触碰的 9-task holdout-v2 上比较完整轨迹，规则完成率仍为主指标。
+
+检查初版 `scripts/7_evaluate_state_actions.py` 时发现，如果根据 gold 使用 `tool_choice=required/none`，评测器会泄漏“此处应调用工具还是最终回答”，无法证明模型学会了动作选择。因此正式实现固定为 `tool_choice=auto`。工具参数按 chosen 精确匹配，以捕获第一轮已经观测到的枚举、数值、时间和 ID 改写；最终答复必须同时通过任务 checker 并包含 teacher grounding 中的 ID。API/service error 从准确率分母排除并单独报告。
+
+本地只读审计 eval 数据得到：14 个 pair 行来自 3 个独立任务；按 `task_id + context_messages` 是 5 个原始状态，加入 chosen action 后是 9 个状态-目标组合。重复来自真实 badcase repeat 和最终答复变体，因此报告必须同时写 pair 数和独立任务数，不能宣称 14 个独立任务。
+
+### 实现与产物协议
+
+新增 `scripts/7_evaluate_state_actions.py`，支持：
+
+- ShareGPT `human/function_call/observation` 到 OpenAI messages 的协议转换；
+- base/DPO 自由 next-action 生成与逐 pair JSONL；
+- 工具名、参数键、精确参数值、final checker 和 grounding ID 分项评分；
+- base/DPO pair ID 对齐、按 stress 指标和配对 improved/regressed 计数；
+- API error 独立计数与 summary JSON；
+- 输出 `data/round2/state_eval_base.jsonl`、`data/round2/state_eval_dpo.jsonl` 和 `results/round2/state_action_compare.md`，不接触第一轮路径。
+
+README、teacher-v2 数据卡、第二轮 manifest 和服务器实验指南均已加入三级指标、准确命令、服务执行顺序与结论边界。预注册解释为：reward 提升但状态层不变，优先诊断偏好 shortcut/过拟合；状态层提升但端到端不变，说明局部动作学习没有沿长轨迹传播；只有 holdout 完成率提高且协议、安全和分类别没有明显退化，才是有用 DPO 效果的探索性证据。任一 stress 的退化不得被总平均掩盖。
+
+### 本地命令与验证结果
+
+数据规模审计命令：
+
+```bash
+python3 - <<'PY'
+import json, hashlib
+rows = [json.loads(line) for line in open('data/round2/pref_pairs.jsonl')]
+rows = [row for row in rows if row.get('dataset_split') == 'eval']
+for mode in ('context', 'context_action'):
+    groups = {}
+    for row in rows:
+        value = {'task_id': row['task_id'], 'context': row['context_messages']}
+        if mode == 'context_action':
+            value['action'] = row['chosen_action']
+        key = hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        groups.setdefault(key, []).append(row['pair_id'])
+    print(mode, len(groups), [len(values) for values in groups.values()])
+PY
+```
+
+结果为 `context 5 [1, 2, 8, 1, 2]`、`context_action 9 [1, 1, 1, 3, 3, 2, 1, 1, 1]`；独立 task ID 为 3。
+
+初版实现增加四组测试后先执行一次：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m unittest discover -s tests -v
+```
+
+当时 17 个测试全部通过。随后补充“不得强制 gold 动作类型”的回归测试，最终完整验证命令为：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m py_compile scripts/*.py tests/test_core.py
+python3 scripts/0_validate_tasks.py
+python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
+python3 scripts/7_evaluate_state_actions.py --help
+git diff --check
+git status --short
+git diff --stat
+```
+
+最终结果：18 个单测全部通过；Python 编译无错误；24 条主任务与 9 条 holdout-v2 均通过字段、checker 引用和场景隔离校验；CLI help 正常；`git diff --check` 无输出。本轮没有连接服务器，没有执行任何服务器 shell 命令，没有启动模型服务、DPO 训练、状态动作推理或 holdout 推理，也没有产生或填写第二轮效果数字。

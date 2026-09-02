@@ -57,6 +57,28 @@
 
 除字段、checker 引用、平衡与隔离外，每个 holdout 还生成了一条无占位符的 canonical trace 并通过 checker。但它从未用 base 或 DPO 模型运行，也未根据模型表现修改。它是模型未见的作者合成评测集，不是外部公开 benchmark。
 
+## 预注册评测协议
+
+第二轮按三个层级判断，低层指标不能替代高层结果：
+
+| 层级 | 数据与隔离 | 指标 | 能回答的问题 |
+|---|---|---|---|
+| 训练偏好 | 14 条 task-grouped eval pair，来自 3 个未进入 train 的任务 | reward accuracy、chosen/rejected reward、reward margin | 模型是否学会区分本数据集的 chosen/rejected |
+| 状态决策 | 同一批 eval pair 的运行时消息、工具 schema；base/DPO pair ID 对齐 | 自由生成 next-action accuracy、工具名、精确参数、final checker、grounding ID | 偏好分离是否迁移为未见任务上的局部动作选择 |
+| 端到端 | 9 个全新 `holdout_v2` 任务，每任务 3 个对齐 seed | 规则完成率（主指标）、分类别完成率、协议错误、工具调用与轨迹审计 | 局部变化是否真正改善完整 Agent 工作流 |
+
+状态决策评测必须使用 `tool_choice=auto`；如果评测器按 gold 强制 tool/none，就泄漏了正确动作类型，只能测试参数填充。工具参数默认精确匹配 chosen，目的是捕获第一轮出现的枚举、数值、时间和 ID 语义改写；可能合理的自由文本改写进入人工误差审阅，不悄悄算作正确。API/service error 从准确率分母中排除并单独计数。
+
+14 条 eval pair 只有 3 个独立 `task_id`，且可能共享相同状态或 chosen 变体。因此报告必须同时给出 pair 数和独立任务数，不能把 pair 行数当样本独立性。状态层是定位指标，最终产品结论仍以未触碰的 9-task holdout 完成率为准。
+
+预注册解释规则：
+
+- reward 指标改善、状态动作不改善：偏好 shortcut、记忆数据或小样本过拟合更可能，不能声称 Agent 行为改善；
+- 状态动作改善、端到端不改善：局部决策学习未沿长轨迹传播，需要检查状态分布偏移、错误累积和后续恢复；
+- 端到端完成率改善且无协议、安全或分类别明显退化：才构成 DPO 有用效果的探索性证据；
+- 任何 stress 或关键能力退化都单独报告，不用总平均掩盖；API 错误也不当模型失败混入；
+- 9 个独立 holdout 任务和单 seed 不支持显著性或广泛外推。
+
 ## 轮次隔离
 
 第一轮路径保持不变；第二轮的派生数据、日志、模型和结果分别只写入 `data/round2/`、`runs/round2/`、`outputs/round2/` 和 `results/round2/`。两轮完整路径清单见 `experiments/round1/README.md` 和 `experiments/round2/README.md`。
@@ -101,5 +123,6 @@ split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187
 - 66 条仍是小规模、单领域合成偏好数据。
 - 30 条 closure rejected 是 teacher 构造的通用弱答复，不是线上采样。
 - 不同任务的 pair 数不均衡，eval 仅 3 个独立任务；reward accuracy 只是训练诊断，不是效果结论。
+- 状态决策仍来自合成 train-domain 任务的 task-isolated eval，能诊断迁移但不是独立公开 benchmark，也不能替代完整轨迹。
 - 多轮 ShareGPT 角色与工具 schema 已对齐运行时语义，但 LLaMA-Factory/Qwen 模板与 vLLM/OpenAI 协议的底层 token 仍不保证逐 token 完全同构。
 - 只有实际训练并在固定 holdout-v2 上比较后，才能判断它是否修复第一轮退化。

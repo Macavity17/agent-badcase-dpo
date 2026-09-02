@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import unittest
+from types import SimpleNamespace
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +41,12 @@ LLAMAFACTORY_SPEC = importlib.util.spec_from_file_location(
 )
 llamafactory_export = importlib.util.module_from_spec(LLAMAFACTORY_SPEC)
 LLAMAFACTORY_SPEC.loader.exec_module(llamafactory_export)
+
+STATE_EVAL_SPEC = importlib.util.spec_from_file_location(
+    "state_eval", os.path.join(ROOT, "scripts", "7_evaluate_state_actions.py")
+)
+state_eval = importlib.util.module_from_spec(STATE_EVAL_SPEC)
+STATE_EVAL_SPEC.loader.exec_module(state_eval)
 
 
 class CheckerTest(unittest.TestCase):
@@ -271,6 +278,105 @@ class CheckerTest(unittest.TestCase):
         self.assertIn("下降 7.4pp", dpo_report)
         self.assertIn("格式正确不能替代", dpo_report)
         self.assertIn("只有完成率提高", context_report)
+
+    def test_state_eval_converts_sharegpt_tool_history(self):
+        pair = {
+            "system": "system",
+            "context_messages": [
+                {"from": "human", "value": "task"},
+                {"from": "function_call", "value": '{"name":"read","arguments":{"id":"A-1"}}'},
+                {"from": "observation", "value": '{"result_id":"R-1"}'},
+            ],
+        }
+        messages = state_eval.to_openai_messages(pair)
+        self.assertEqual([row["role"] for row in messages], ["system", "user", "assistant", "tool"])
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], messages[3]["tool_call_id"])
+
+    def test_state_eval_scores_tool_name_keys_and_exact_values(self):
+        expected = {"kind": "tool", "tool": "schedule", "args": {"send_at": "19:30"}}
+        self.assertEqual(
+            state_eval.tool_action_score(expected, {
+                "kind": "tool", "tool": "schedule", "args": {"send_at": "19:30"},
+            }),
+            (True, True, True),
+        )
+        self.assertEqual(
+            state_eval.tool_action_score(expected, {
+                "kind": "tool", "tool": "schedule", "args": {"send_at": "19点30分"},
+            }),
+            (True, True, False),
+        )
+        self.assertEqual(
+            state_eval.tool_action_score(expected, {
+                "kind": "tool", "tool": "notify", "args": {"send_at": "19:30"},
+            }),
+            (False, False, False),
+        )
+
+    def test_state_eval_final_requires_checker_and_grounding(self):
+        pair = {
+            "chosen_action": {"kind": "final", "content": "完成 R-1"},
+            "chosen_grounding": [{"value": "R-1", "source": "observation:write"}],
+            "context_messages": [
+                {"from": "human", "value": "task"},
+                {"from": "function_call", "value": '{"name":"write","arguments":{}}'},
+                {"from": "observation", "value": '{"result_id":"R-1"}'},
+                {"from": "function_call", "value": '{"name":"finish_task","arguments":{}}'},
+                {"from": "observation", "value": '{"status":"ready_for_final"}'},
+            ],
+        }
+        task = {"checker": {"type": "all", "checks": [
+            {"type": "tool_call", "expect_tool": "write", "expect_args_contains": {}},
+            {"type": "final_contains_all", "values": ["完成"]},
+        ]}}
+        correct = state_eval.score_action(pair, task, {"kind": "final", "content": "完成，结果 R-1"})
+        missing_id = state_eval.score_action(pair, task, {"kind": "final", "content": "完成"})
+        failed_task = state_eval.score_action(pair, task, {"kind": "final", "content": "结果 R-1"})
+        self.assertTrue(correct["action_correct"])
+        self.assertTrue(missing_id["final_task_complete"])
+        self.assertFalse(missing_id["action_correct"])
+        self.assertFalse(failed_task["action_correct"])
+
+    def test_state_eval_aligns_pairs_and_reports_regressions(self):
+        base = [
+            {"pair_id": "a", "task_id": "t1", "stress": "tool_misuse", "expected_kind": "tool", "action_correct": True, "tool_name_correct": True, "argument_values_correct": True, "error": None},
+            {"pair_id": "b", "task_id": "t2", "stress": "planning_drift", "expected_kind": "final", "action_correct": False, "final_task_complete": False, "final_grounding_complete": True, "error": None},
+        ]
+        dpo = [
+            {**base[1], "action_correct": True, "final_task_complete": True},
+            {**base[0], "action_correct": False, "tool_name_correct": False, "argument_values_correct": False},
+        ]
+        report = state_eval.compare_report(base, dpo)
+        self.assertIn("Aligned valid pairs improved/regressed: 1/1", report)
+        self.assertIn("independent eval tasks: 2", report)
+        with self.assertRaisesRegex(ValueError, "pair_id 不对齐"):
+            state_eval.align_rows(base, dpo[:1])
+
+    def test_state_eval_does_not_force_gold_action_kind(self):
+        captured = {}
+
+        class Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(
+                        tool_calls=None, content="完成 R-1",
+                    ))],
+                    usage=SimpleNamespace(prompt_tokens=10),
+                )
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        pair = {
+            "pair_id": "p1", "task_id": "t1", "stress": "planning_drift",
+            "decision_index": 1, "system": "system", "tools": [],
+            "context_messages": [{"from": "human", "value": "task"}],
+            "chosen_action": {"kind": "final", "content": "完成 R-1"},
+            "chosen_grounding": [{"value": "R-1", "source": "observation:write"}],
+        }
+        task = {"checker": {"type": "final_contains_all", "values": ["完成"]}}
+        state_eval.evaluate_one(client, "base", pair, task, 0.0, 1)
+        self.assertEqual(captured["tool_choice"], "auto")
 
 
 if __name__ == "__main__":
