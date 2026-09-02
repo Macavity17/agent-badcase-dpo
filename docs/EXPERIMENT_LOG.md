@@ -1497,3 +1497,243 @@ vendor/
 ```
 
 该改动只改变 Git 是否报告/暂存该目录：不会删除或修改服务器 `vendor/LLaMA-Factory`，不会改变基座模型、第一轮或第二轮输出，也不会影响训练时通过该目录调用 LLaMA-Factory。后续服务器同步后，`git status --short` 应不再显示 `vendor/`。
+
+## 2026-09-03 / Run 20：teacher-v2 训练、三级评测与负结果
+
+### 保护性盘点与数据重建
+
+服务器通过已验证 Git bundle 快进到 `06edb5d`，随后核对第一轮产物：`outputs/dpo-qwen15b` 为 527 MB，`outputs/dpo_merged` 为 2.9 GB；旧证据包 `/root/autodl-tmp/care-agent-evidence-20260903.tar.gz` 为 215 KB，SHA-256 仍为 `e9ad0708ce2b2764053aa0a37e598fd4c5ccc0d08d8a9bf2dae109a6dfc88347`。第二轮 adapter/merged 路径当时不存在，数据盘剩余约 155 GB，GPU 显存为 0 MiB，没有 vLLM 或 LLaMA-Factory 进程。第一轮产物未被移动或覆盖。
+
+重建结果：98 条候选、22 条审阅排除、66 条最终偏好对，其中 52 train / 14 eval；train/eval 任务零重叠，分别覆盖 12/3 个任务。四个派生数据哈希与数据卡完全一致，18 个服务器单测通过，9 条 `holdout_v2` 校验通过。
+
+### 训练失败、修复与成功 run
+
+第一次训练使用 `per_device_train_batch_size: 2`、`cutoff_len: 4096`，在 step 0 发生 CUDA OOM。该失败没有被覆盖：日志、PID 和空输出目录分别保存为 `runs/round2/dpo_train_oom_batch2.log`、`runs/round2/dpo_train_oom_batch2.pid` 和 `outputs/round2/dpo-adapter-oom-batch2`。
+
+修复提交 `2339b9f` 将 micro-batch 改为 1、梯度累积改为 8，有效 batch 仍为 8；同时设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。成功 run 使用 52 train / 14 eval、3 epoch、21 optimization steps，运行 82.897 秒。结果：train loss `0.672958`，eval loss `0.666803`，eval reward accuracy `0.928571`，eval reward margin `0.054155`；best checkpoint 为 `outputs/round2/dpo-adapter/checkpoint-20`，adapter 约 527 MB。
+
+合并模型保存在 `outputs/round2/merged`，约 2.9 GB；`model.safetensors` SHA-256 为 `840751b37a0bbad3a51e51c27ea574a3e716a992ba8b49cd4605f448c07fb9ea`。
+
+### 服务与三级评测
+
+第一次直接调用 `care-infer` 环境 Python 启动 base vLLM 失败，原因是没有携带 Conda 环境 PATH，导致找不到 `ninja`。失败日志和 PID 保留为 `runs/round2/vllm_base_missing_ninja.log` 和 `.pid`。改用 `conda run -p /root/miniconda3/envs/care-infer` 后 base 服务正常。
+
+状态动作评测包含 14 条 pair row，但仅来自 3 个独立任务：
+
+| 指标 | Base | DPO |
+|---|---:|---:|
+| 下一动作准确率 | 14.3% | 14.3% |
+| 工具名准确率 | 50.0% | 50.0% |
+| 精确工具参数准确率 | 0.0% | 0.0% |
+| 最终答复 task checker | 33.3% | 33.3% |
+| 最终答复 grounding | 16.7% | 16.7% |
+
+API 错误为 0，paired improved/regressed 为 `0/0`。报告保存为 `results/round2/state_action_compare.md`。
+
+9-task 未见 `holdout_v2` 每任务重复 3 次，Base 和 DPO 均为 `0/27`；工具调用率均为 100%，协议错误均为 0%，平均步数均为 6.67，三类 stress 均为 0/9。正确报告为 `results/round2/dpo_compare_seed20260904.md`。评测指南初版命令漏了 `--tasks tasks/holdout_v2.jsonl`，因此误用旧任务导致 0 条对齐评测；错误报告保留为 `results/round2/dpo_compare_missing_tasks.md`，然后使用显式 `--tasks` 重新生成正确报告。
+
+27 组对齐轨迹中，15 组输出发生变化，4 组工具轨迹发生变化，但每个 checker 子条件的 Base/DPO 通过数都完全相同。局部正变化包括 `pd_h2_001` 的授权跟进从错误 `within_days: "1"` 变为正确 `"3"`，`pd_h2_002` 的通知补充明确未来 24 小时指引；回归包括 `pd_h2_003` 的出院摘要内容变为空字符串。其他变化多为最终答复措辞。部分失败也暴露 checker 的字面 grounding 局限，例如模型输出中文“语音”而 checker 要求字面 `voice`。
+
+结论必须按预注册层级解读：偏好分离改善；状态动作决策没有改善；端到端完成没有改善。因此这轮不支持 DPO 带来 Agent 效果提升；更合理的归因是偏好 shortcut/小更新未迁移到实际决策，并且产生了混合的局部改善与新回归。不宣称 uplift。评测结束后 base/DPO vLLM 均已停止，GPU 显存回到 0 MiB。
+
+### 服务器完整命令账本
+
+以下是本轮已执行的全部服务器 shell 命令，包含诊断、失败、等待、日志检查、修复与进程停止：
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+git pull --ff-only origin main
+git status --short
+git rev-parse HEAD
+git rev-parse origin/main
+exit
+cd /root/autodl-tmp/agent-badcase-dpo
+git bundle verify /root/autodl-tmp/agent-badcase-dpo-06edb5d.bundle
+git fetch /root/autodl-tmp/agent-badcase-dpo-06edb5d.bundle HEAD:refs/remotes/origin/main
+git fsck --connectivity-only origin/main
+git merge --ff-only origin/main
+git status --short
+git rev-parse HEAD
+du -sh outputs/dpo-qwen15b outputs/dpo_merged
+ls -lh /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+sha256sum /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+find outputs/dpo-qwen15b -maxdepth 1 -type f -printf '%f\n' | sort
+find outputs/dpo_merged -maxdepth 1 -type f -printf '%f\n' | sort
+test ! -e outputs/round2/dpo-adapter && echo round2-adapter-path-clear
+test ! -e outputs/round2/merged && echo round2-merged-path-clear
+df -h /root/autodl-tmp
+nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader
+pgrep -af 'vllm|llamafactory' || true
+mkdir -p data/round2 runs/round2 results/round2 outputs/round2
+/root/miniconda3/envs/care-infer/bin/python scripts/6_build_teacher_v2.py --badcase data/train_badcases_labeled.jsonl --tasks tasks/tasks.jsonl --specs tasks/teacher_v2_specs.jsonl --review experiments/round2/pair_review.jsonl --split experiments/round2/split.json --out data/round2/pref_pairs.jsonl
+/root/miniconda3/envs/care-infer/bin/python scripts/4_to_llamafactory.py --pref data/round2/pref_pairs.jsonl --outdir data/round2/lf_data --train-config config/dpo_teacher_v2.yaml
+/root/miniconda3/envs/care-infer/bin/python scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
+/root/miniconda3/envs/care-infer/bin/python -m unittest discover -s tests -v
+sha256sum data/round2/pref_pairs.jsonl data/round2/pref_pairs.audit.jsonl data/round2/lf_data/agent_pref_train.json data/round2/lf_data/agent_pref_eval.json
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; tr=json.load(open("data/round2/lf_data/agent_pref_train.json")); ev=json.load(open("data/round2/lf_data/agent_pref_eval.json")); a={x["task_id"] for x in tr}; b={x["task_id"] for x in ev}; print("train/eval rows",len(tr),len(ev),"task overlap",sorted(a&b),"tasks",len(a),len(b))'
+nohup conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli train config/dpo_teacher_v2.yaml > runs/round2/dpo_train.log 2>&1 &
+echo $! > runs/round2/dpo_train.pid
+cat runs/round2/dpo_train.pid
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; rows=[json.loads(x) for x in open("data/round2/pref_pairs.jsonl")]; a={x["task_id"] for x in rows if x["dataset_split"]=="train"}; b={x["task_id"] for x in rows if x["dataset_split"]=="eval"}; print("task overlap",sorted(a&b),"tasks",len(a),len(b))'
+tail -n 120 runs/round2/dpo_train.log
+pgrep -af 'llamafactory|trainer.py' || true
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+find outputs/round2/dpo-adapter -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+ls -lh runs/round2/dpo_train.log runs/round2/dpo_train.pid
+test ! -e runs/round2/dpo_train_oom_batch2.log
+test ! -e runs/round2/dpo_train_oom_batch2.pid
+test ! -e outputs/round2/dpo-adapter-oom-batch2
+mv runs/round2/dpo_train.log runs/round2/dpo_train_oom_batch2.log
+mv runs/round2/dpo_train.pid runs/round2/dpo_train_oom_batch2.pid
+mv outputs/round2/dpo-adapter outputs/round2/dpo-adapter-oom-batch2
+git bundle verify /root/autodl-tmp/agent-badcase-dpo-2339b9f.bundle
+git fetch /root/autodl-tmp/agent-badcase-dpo-2339b9f.bundle HEAD:refs/remotes/origin/main
+git fsck --connectivity-only origin/main
+git merge --ff-only origin/main
+git status --short
+grep -n 'per_device_train_batch_size\|gradient_accumulation_steps' config/dpo_teacher_v2.yaml
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli train config/dpo_teacher_v2.yaml > runs/round2/dpo_train_batch1.log 2>&1 &
+echo $! > runs/round2/dpo_train_batch1.pid
+cat runs/round2/dpo_train_batch1.pid
+tail -n 80 runs/round2/dpo_train_batch1.log
+pgrep -af 'llamafactory|trainer.py' || true
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+grep -E 'Running training|Total optimization steps|loss|rewards/|CUDA out|OutOfMemory|train_runtime|eval_' runs/round2/dpo_train_batch1.log | tail -n 60
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+pgrep -af 'llamafactory|trainer.py' || true
+sleep 20
+grep -E 'loss|train_runtime|eval_loss|rewards/accuracies|rewards/margins|CUDA out|OutOfMemory' runs/round2/dpo_train_batch1.log | tail -n 40
+pgrep -af 'llamafactory|trainer.py' || true
+cat outputs/round2/dpo-adapter/all_results.json
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; x=json.load(open("outputs/round2/dpo-adapter/trainer_state.json")); print("best_model_checkpoint",x.get("best_model_checkpoint"),"best_metric",x.get("best_metric"),"global_step",x.get("global_step"))'
+du -sh outputs/round2/dpo-adapter
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli export config/merge_teacher_v2.yaml > runs/round2/merge.log 2>&1
+tail -n 80 runs/round2/merge.log
+find outputs/round2/merged -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+du -sh outputs/round2/merged
+sha256sum outputs/round2/merged/model.safetensors
+sed -n '80,118p' docs/EXPERIMENT_GUIDE.md
+sed -n '64,88p' docs/EXPERIMENT_GUIDE.md
+nohup /root/miniconda3/envs/care-infer/bin/python -m vllm.entrypoints.openai.api_server --model ./models/Qwen2.5-1.5B-Instruct --served-model-name base --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/round2/vllm_base.log 2>&1 &
+echo $! > runs/round2/vllm_base.pid
+cat runs/round2/vllm_base.pid
+sleep 20
+tail -n 60 runs/round2/vllm_base.log
+curl -s http://localhost:8000/v1/models
+test ! -e runs/round2/vllm_base_missing_ninja.log
+test ! -e runs/round2/vllm_base_missing_ninja.pid
+mv runs/round2/vllm_base.log runs/round2/vllm_base_missing_ninja.log
+mv runs/round2/vllm_base.pid runs/round2/vllm_base_missing_ninja.pid
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+nohup conda run --no-capture-output -p /root/miniconda3/envs/care-infer python -m vllm.entrypoints.openai.api_server --model ./models/Qwen2.5-1.5B-Instruct --served-model-name base --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/round2/vllm_base.log 2>&1 &
+echo $! > runs/round2/vllm_base.pid
+cat runs/round2/vllm_base.pid
+sleep 20
+tail -n 40 runs/round2/vllm_base.log
+curl -s http://localhost:8000/v1/models
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py --pairs data/round2/pref_pairs.jsonl --tasks tasks/tasks.jsonl --split eval --port 8000 --model base --temperature 0 --seed 20260904 --out data/round2/state_eval_base.jsonl
+nohup /root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py --tasks tasks/holdout_v2.jsonl --split test --strategy full --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 --port 8000 --model base --out data/round2/holdout_base_full_seed20260904.jsonl > runs/round2/holdout_base.log 2>&1 &
+echo $! > runs/round2/holdout_base.pid
+cat runs/round2/holdout_base.pid
+sleep 25
+wc -l data/round2/holdout_base_full_seed20260904.jsonl
+pgrep -af '1_run_baseline.py.*holdout_v2' || true
+tail -n 30 runs/round2/holdout_base.log
+grep -n '"type": "error"' data/round2/holdout_base_full_seed20260904.jsonl || true
+kill 14549
+sleep 5
+pgrep -af 'vllm.entrypoints.openai.api_server' || true
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+kill 14559
+sleep 5
+pgrep -af 'vllm.entrypoints.openai.api_server' || true
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+nohup conda run --no-capture-output -p /root/miniconda3/envs/care-infer python -m vllm.entrypoints.openai.api_server --model ./outputs/round2/merged --served-model-name dpo-round2 --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/round2/vllm_dpo.log 2>&1 &
+echo $! > runs/round2/vllm_dpo.pid
+cat runs/round2/vllm_dpo.pid
+sleep 20
+tail -n 40 runs/round2/vllm_dpo.log
+curl -s http://localhost:8001/v1/models
+sleep 15
+tail -n 30 runs/round2/vllm_dpo.log
+curl -s http://localhost:8001/v1/models
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py --pairs data/round2/pref_pairs.jsonl --tasks tasks/tasks.jsonl --split eval --port 8001 --model dpo-round2 --temperature 0 --seed 20260904 --out data/round2/state_eval_dpo.jsonl
+/root/miniconda3/envs/care-infer/bin/python scripts/7_evaluate_state_actions.py --compare-before data/round2/state_eval_base.jsonl --compare-after data/round2/state_eval_dpo.jsonl --report results/round2/state_action_compare.md
+nohup /root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py --tasks tasks/holdout_v2.jsonl --split test --strategy full --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 --port 8001 --model dpo-round2 --out data/round2/holdout_dpo_full_seed20260904.jsonl > runs/round2/holdout_dpo.log 2>&1 &
+echo $! > runs/round2/holdout_dpo.pid
+cat runs/round2/holdout_dpo.pid
+sleep 25
+wc -l data/round2/holdout_dpo_full_seed20260904.jsonl
+pgrep -af '1_run_baseline.py.*holdout_v2' || true
+tail -n 30 runs/round2/holdout_dpo.log
+grep -n '"type": "error"' data/round2/holdout_dpo_full_seed20260904.jsonl || true
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py --before data/round2/holdout_base_full_seed20260904.jsonl --after data/round2/holdout_dpo_full_seed20260904.jsonl --out results/round2/dpo_compare_seed20260904.md
+sed -n '1,240p' results/round2/dpo_compare_seed20260904.md
+sed -n '1p' data/round2/holdout_base_full_seed20260904.jsonl
+sed -n '1,220p' scripts/5_evaluate.py
+sed -n '220,430p' scripts/5_evaluate.py
+test ! -e results/round2/dpo_compare_missing_tasks.md
+mv results/round2/dpo_compare_seed20260904.md results/round2/dpo_compare_missing_tasks.md
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py --tasks tasks/holdout_v2.jsonl --before data/round2/holdout_base_full_seed20260904.jsonl --after data/round2/holdout_dpo_full_seed20260904.jsonl --out results/round2/dpo_compare_seed20260904.md
+sed -n '1,240p' results/round2/dpo_compare_seed20260904.md
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; ts={x["task_id"]:x for x in map(json.loads,open("tasks/holdout_v2.jsonl"))}; tr=json.loads(next(open("data/round2/holdout_base_full_seed20260904.jsonl"))); print(json.dumps(ts[tr["task_id"]]["checker"],ensure_ascii=False,indent=2))'
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; b=[json.loads(x) for x in open("data/round2/holdout_base_full_seed20260904.jsonl")]; a=[json.loads(x) for x in open("data/round2/holdout_dpo_full_seed20260904.jsonl")]; bm={(x["task_id"],x["repeat"]):x for x in b}; am={(x["task_id"],x["repeat"]):x for x in a}; ks=sorted(bm); ch=[k for k in ks if (bm[k]["tool_calls"],bm[k]["final_answer"])!=(am[k]["tool_calls"],am[k]["final_answer"])]; print("aligned",len(ks),"changed",len(ch)); [print(k,"TOOLS",bm[k]["tool_calls"]!=am[k]["tool_calls"],"FINAL",bm[k]["final_answer"]!=am[k]["final_answer"],"\n B:",bm[k]["final_answer"],"\n A:",am[k]["final_answer"]) for k in ch]'
+kill 14992
+sleep 5
+pgrep -af 'vllm.entrypoints.openai.api_server' || true
+kill 15003
+sleep 5
+pgrep -af 'vllm.entrypoints.openai.api_server' || true
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+/root/miniconda3/envs/care-infer/bin/python -c 'import json,sys; sys.path.insert(0,"scripts"); from utils import _check_one; ts={x["task_id"]:x for x in map(json.loads,open("tasks/holdout_v2.jsonl"))}; fs={"base":"data/round2/holdout_base_full_seed20260904.jsonl","dpo":"data/round2/holdout_dpo_full_seed20260904.jsonl"}; [(print(label),[print(tid,[(c["type"],sum(_check_one(c,r) for r in rs),len(rs)) for c in ts[tid]["checker"]["checks"]]) for tid in sorted(ts) for rs in [[x for x in map(json.loads,open(path)) if x["task_id"]==tid]]]) for label,path in fs.items()]'
+/root/miniconda3/envs/care-infer/bin/python -c 'import json; b=[json.loads(x) for x in open("data/round2/holdout_base_full_seed20260904.jsonl")]; a=[json.loads(x) for x in open("data/round2/holdout_dpo_full_seed20260904.jsonl")]; bm={(x["task_id"],x["repeat"]):x for x in b}; am={(x["task_id"],x["repeat"]):x for x in a}; ks=[k for k in sorted(bm) if bm[k]["tool_calls"]!=am[k]["tool_calls"]]; [print(k,"\nBASE",json.dumps(bm[k]["tool_calls"],ensure_ascii=False),"\nDPO ",json.dumps(am[k]["tool_calls"],ensure_ascii=False)) for k in ks]'
+pwd
+history 180
+```
+
+`git pull --ff-only origin main` 因 GitHub 网络问题失败，之后改用本地生成且在服务器上经 `git bundle verify`/`git fsck` 验证的 bundle。`history 180` 用于核对本轮账本没有遗漏；其本身与当前工作目录检查 `pwd` 也按要求记入。
+
+### 第二轮证据包
+
+评测结束后继续执行以下服务器命令，为数据、日志、报告、配置和环境元数据生成轻量证据包。模型权重不放入压缩包，但单独记录 adapter 与 merged model 哈希。
+
+```bash
+du -sh data/round2 runs/round2 results/round2 outputs/round2/dpo-adapter outputs/round2/merged
+sha256sum outputs/round2/dpo-adapter/adapter_model.safetensors outputs/round2/merged/model.safetensors > results/round2/model_sha256.txt
+find data/round2 runs/round2 results/round2 config/dpo_teacher_v2.yaml config/merge_teacher_v2.yaml tasks/teacher_v2_specs.jsonl tasks/holdout_v2.jsonl experiments/round2 scripts/1_run_baseline.py scripts/4_to_llamafactory.py scripts/5_evaluate.py scripts/6_build_teacher_v2.py scripts/7_evaluate_state_actions.py scripts/utils.py -type f -print0 | sort -z | xargs -0 sha256sum > results/round2/artifact_sha256.txt
+{ git rev-parse HEAD; git status --short; /root/miniconda3/envs/care-infer/bin/python --version; conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli version; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; } > results/round2/server_metadata.txt
+sed -n '1,40p' results/round2/model_sha256.txt
+sed -n '1,80p' results/round2/server_metadata.txt
+wc -l results/round2/artifact_sha256.txt
+tar -czf /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz data/round2 runs/round2 results/round2 config/dpo_teacher_v2.yaml config/merge_teacher_v2.yaml tasks/teacher_v2_specs.jsonl tasks/holdout_v2.jsonl experiments/round2 scripts/1_run_baseline.py scripts/4_to_llamafactory.py scripts/5_evaluate.py scripts/6_build_teacher_v2.py scripts/7_evaluate_state_actions.py scripts/utils.py
+ls -lh /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz
+sha256sum /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz
+tar -tzf /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz | wc -l
+```
+
+结果：`data/round2` 1.7 MB、`runs/round2` 368 KB、`results/round2` 12 KB、adapter 527 MB、merged model 2.9 GB。产物清单包含 46 条文件哈希；证据包包含 52 个 tar entry，大小 144 KB，保存为 `/root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz`，SHA-256 为 `590974ca8bad782eb957b10c06e40f44429c96b02750a4016ab34f534408483c`。adapter 权重 SHA-256 为 `118de03d6e09054e99f0b66a1f06fd79971a973786ba9949f417504cb495cbfb`；merged 权重哈希与前述一致。元数据记录服务器 HEAD `2339b9fc54b9e1d2498b01a7211f4d40bd81061b`、Python 3.11.16、LLaMA-Factory 0.9.6.dev0、RTX 4090 D/driver 580.76.05，归档时 GPU 显存 0 MiB。
+
+### 本地证据下载尝试与文档收口
+
+为避免在命令或日志中暴露密码，Mac 仅尝试了非交互、不使用密码的下载：
+
+```bash
+scp -o BatchMode=yes -o ConnectTimeout=15 -P 24138 root@connect.cqa1.seetacloud.com:/root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz /private/tmp/care-agent-evidence-round2-20260903.tar.gz
+```
+
+返回 `Permission denied (publickey,password)`，说明现有交互式 SSH 会话的密码认证不能自动复用给新 `scp` 进程。这不影响服务器证据包；其仍保存在前述路径且已校验哈希。后续应从 AutoDL Jupyter 文件管理器下载，或在用户可交互输入密码的终端中执行 `scp`。
+
+本地随后将实际结果写入 `README.md`、`docs/DATA_CARD_TEACHER_V2.md`、`docs/EXPERIMENT_GUIDE.md`、`experiments/round2/README.md` 和被 Git 忽略的 `PROJECT_MEMORY.md`。文档明确保留三级证据边界：92.9% reward accuracy 不能代替 14.3% 不变的 next-action accuracy，也不能代替 Base/DPO 同为 0/27 的 holdout-v2 完成率。实验指南同时补充 micro-batch 1 / accumulation 8、`PYTORCH_CUDA_ALLOC_CONF`、带完整 PATH 的 `conda run` vLLM 启动、显式 `--tasks tasks/holdout_v2.jsonl` 与轻量证据归档命令。
+
+本地验证命令：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m py_compile scripts/*.py tests/test_core.py
+python3 scripts/0_validate_tasks.py
+python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
+git diff --check
+```
+
+结果：18 个单测全部通过；Python 编译无错误；24 条主任务与 9 条 holdout-v2 均通过字段、checker 引用和场景隔离校验；`git diff --check` 无输出。本阶段没有再启动模型、训练或修改 holdout/checker。

@@ -149,11 +149,11 @@ python3 scripts/5_evaluate.py \
 
 DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训练内 eval reward accuracy 为 1.0、reward margin 为 0.217，但这种偏好分离没有转化为任务收益：训练任务上 base/DPO 都为 22/90，冻结 holdout 则从 4/27 降至 2/27。对齐轨迹显示两类退化：精确参数复用变成语义改写（如 `2` -> `连续两天`、`next_week` -> `next`），以及最终答复漏掉工具返回 ID。也观察到一个局部改善：DPO 在一条设备轨迹中避免了 base 的禁止同步调用，但仍未使该轨迹通过 checker。这说明“工具协议 0 错误”并不等于“工作流完成”，也为下一轮数据标准提供了明确方向：对 schema 值域、观测引用和结果回传分别设置评测与训练信号。
 
-### 第二轮数据修复（已准备，尚未训练）
+### 第二轮：从 reward 分离到 Agent 效果
 
 针对第一轮暴露的训练/运行协议错位，第二轮不再把整条多工具轨迹放进单个 assistant response。每条数据现在使用原生 `human -> function_call -> observation` 多轮结构与工具 schema，只学习首次有意义分歧点的一个下一动作。98 条候选中，22 个候选行因近义措辞、等价序列化或 schema 未定义枚举等弱偏好被人工规则排除；审阅去重后保留 66 条，其中 36 条来自真实 badcase 分歧，30 条是结果回传 hard negative。
 
-训练内部另按 `task_id` 固定为 52 train / 14 eval，不再随机拆分同一任务的 pair。同时新建了 9 条未运行的 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。第二轮所有派生数据、日志、模型和结果都进入独立 `round2/` 路径，不覆盖第一轮。当前没有第二轮训练结果。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
+训练内部另按 `task_id` 固定为 52 train / 14 eval，不再随机拆分同一任务的 pair。同时新建 9 条 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。第二轮所有派生数据、日志、模型和结果均进入独立 `round2/` 路径，第一轮 adapter、merged model 和证据包在训练前后均保持不变。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
 
 第二轮预注册三层证据，不能互相替代：
 
@@ -161,7 +161,19 @@ DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训�
 2. **状态决策层**：把相同 eval state 交给 base/DPO 自由生成一个下一动作，`tool_choice=auto`，不给“应调用工具还是最终回答”的 oracle 提示。分别检查动作类型、工具名、参数键、精确参数值、最终答复 checker 和 grounding ID。该层用于定位偏好是否迁移为局部决策能力，仍是诊断指标。
 3. **端到端层**：在从未用于训练或调参的 9-task `holdout_v2` 上，以相同 seed 各运行 27 条完整轨迹。规则完成率是主产品指标，并同时检查协议错误、工具调用、参数复用、结果 ID 回传和各 stress 退化。
 
-结论遵循预注册边界：reward 改善但状态决策不变，优先解释为偏好捷径或过拟合；状态决策改善但端到端不变，说明局部动作学习没有沿长轨迹传播；只有端到端完成率提高且协议、安全和分 stress 指标没有明显退化，才算第二轮出现有用的 DPO 效果。任一 stress 的退化必须单列，不能被总平均掩盖。由于仅 9 个独立 holdout 任务、单 seed，本轮无论正负都只作探索性证据。
+实际结果严格对应预注册的第一种情形：
+
+| 证据层 | Base | teacher-v2 DPO | 解读 |
+|---|---:|---:|---|
+| task-grouped eval reward | - | accuracy 92.9%，margin 0.054 | 可区分这批 chosen/rejected |
+| 自由 next-action | 14.3% | 14.3% | 局部动作准确率未提升 |
+| 精确工具参数 | 0.0% | 0.0% | 值约束未迁移 |
+| 最终答复 task checker | 33.3% | 33.3% | 闭环表达未提升 |
+| `holdout_v2` 完成率 | 0/27 | 0/27 | 端到端无 uplift |
+
+14 条状态 pair 仅来自 3 个独立 eval 任务；端到端评测为 9 个全新任务、每个 3 个对齐 seed。Base/DPO 的工具调用率均为 100%、协议错误均为 0%，但三类 stress 也均为 0/9。27 组对齐轨迹中 15 组输出改变、4 组工具轨迹改变，但没有一个 checker 子条件的总通过数发生变化。它既有局部改善（授权跟进的 `within_days` 从错误 1 改为正确 3），也有新回归（一条出院摘要参数变为空字符串）。
+
+因此这一轮不支持“DPO 改善了 Agent”。它支持一个更精确的产品/策略结论：即使修复多轮序列化、任务泄漏和弱偏好对，小规模 DPO 仍可能只学到偏好分离，而没有学到可在自由生成和长轨迹中稳定复用的决策规则。这也说明 reward、状态动作和端到端完成率必须分层评测，不能用低层指标替代产品效果。由于仅 3 个状态 eval 任务、9 个 holdout 任务和单 seed，结论只作探索性证据，不外推为“DPO 无效”。
 
 ## 局限
 

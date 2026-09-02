@@ -29,3 +29,11 @@ Evidence is interpreted in this order: LLaMA-Factory reward separation,
 free-generated state-action accuracy, then end-to-end holdout completion.
 State-action evaluation uses `tool_choice=auto`; it is diagnostic, while the
 untouched holdout completion rate remains the primary product metric.
+
+The completed run used 52 train and 14 task-grouped eval pairs for three
+epochs. Eval reward accuracy reached 0.928571 and reward margin 0.054155, but
+base and DPO next-action accuracy were both 14.3%, and both completed 0/27
+aligned holdout-v2 trajectories. The result is a negative transfer result,
+not an uplift claim. The lightweight server evidence archive is
+`/root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz` with SHA-256
+`590974ca8bad782eb957b10c06e40f44429c96b02750a4016ab34f534408483c`.

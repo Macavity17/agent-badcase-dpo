@@ -420,16 +420,17 @@ mkdir -p data/round2 runs/round2 results/round2 outputs/round2
 第二轮必须使用独立输出路径：
 
 ```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 nohup conda run --no-capture-output \
   -p /root/autodl-tmp/envs/care-train \
   llamafactory-cli train config/dpo_teacher_v2.yaml \
-  > runs/round2/dpo_train.log 2>&1 &
-echo $! > runs/round2/dpo_train.pid
+  > runs/round2/dpo_train_batch1.log 2>&1 &
+echo $! > runs/round2/dpo_train_batch1.pid
 
-tail -f runs/round2/dpo_train.log
+tail -f runs/round2/dpo_train_batch1.log
 
 grep -E "eval_loss|rewards/accuracies|rewards/margins|rewards/chosen|rewards/rejected" \
-  runs/round2/dpo_train.log
+  runs/round2/dpo_train_batch1.log
 
 conda run --no-capture-output \
   -p /root/autodl-tmp/envs/care-train \
@@ -437,11 +438,23 @@ conda run --no-capture-output \
   > runs/round2/merge.log 2>&1
 ```
 
+`config/dpo_teacher_v2.yaml` 固定为 micro-batch 1、gradient accumulation 8，有效 batch 为 8。实验中 micro-batch 2 在 4090D/24 GB、`cutoff_len=4096` 下于 step 0 OOM；失败日志、PID 和输出目录应保留为新名称，不覆盖成功 run。
+
 评测分三层：训练日志中的 reward 指标、task-grouped eval state 上的自由下一动作、全新 holdout-v2 上的完整轨迹。状态层必须使用 `tool_choice=auto`，脚本不会按 gold 强制 tool/none；否则只是在测试参数填充。base 和 teacher-v2 DPO 的输入、pair ID 与 seed 必须对齐。
 
 端到端层必须在 `tasks/holdout_v2.jsonl` 上使用相同的 `repeats=3`、`temperature=0.2`、`seed=20260904`。先让 8000 端口的 base 服务连续完成状态与 holdout 两种评测并保存结果，再停止 base、启动 DPO，在 8001 端口按同序执行。不要查看 base 轨迹后修改 eval pair、holdout 或 checker：
 
 ```bash
+# 使用 conda run 带全环境 PATH；只调用 env 内 Python 会缺失 ninja。
+nohup conda run --no-capture-output \
+  -p /root/miniconda3/envs/care-infer \
+  python -m vllm.entrypoints.openai.api_server \
+  --model ./models/Qwen2.5-1.5B-Instruct --served-model-name base \
+  --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.85 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  > runs/round2/vllm_base.log 2>&1 &
+echo $! > runs/round2/vllm_base.pid
+
 /root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
   --tasks tasks/holdout_v2.jsonl --split test --strategy full \
   --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
@@ -488,6 +501,7 @@ grep -n '"error": "' data/round2/state_eval_dpo.jsonl || true
   --report results/round2/state_action_compare.md
 
 /root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py \
+  --tasks tasks/holdout_v2.jsonl \
   --before data/round2/holdout_base_full_seed20260904.jsonl \
   --after data/round2/holdout_dpo_full_seed20260904.jsonl \
   --out results/round2/dpo_compare_seed20260904.md
@@ -501,7 +515,50 @@ grep -n '"error": "' data/round2/state_eval_dpo.jsonl || true
 
 若 reward 改善但状态层不变，记录为偏好 shortcut/过拟合候选；若状态层改善而端到端不变，记录为局部学习没有沿长轨迹传播。任何类别退化和 API error 都必须单列，API error 不混入模型准确率分母，也不能用总平均掩盖。由于只有 3 个状态 eval 任务、9 个 holdout 任务和单 seed，结论统一标为探索性。
 
-本节只定义预注册执行条件，不代表第二轮已经训练或取得提升。
+本轮实际结果：52 train / 14 eval、3 epoch、21 steps，reward accuracy 92.9%、margin 0.054；Base/DPO next-action accuracy 均 14.3%，`holdout_v2` 均为 0/27。结果符合“reward 改善但状态决策不变”的预注册边界，不支持 uplift。
+
+### 15.1 第二轮证据归档
+
+不将 527 MB adapter 和 2.9 GB merged model 放入轻量证据包，但必须保存权重哈希、环境元数据和全部生成产物哈希：
+
+```bash
+sha256sum \
+  outputs/round2/dpo-adapter/adapter_model.safetensors \
+  outputs/round2/merged/model.safetensors \
+  > results/round2/model_sha256.txt
+
+find data/round2 runs/round2 results/round2 \
+  config/dpo_teacher_v2.yaml config/merge_teacher_v2.yaml \
+  tasks/teacher_v2_specs.jsonl tasks/holdout_v2.jsonl \
+  experiments/round2 scripts/1_run_baseline.py \
+  scripts/4_to_llamafactory.py scripts/5_evaluate.py \
+  scripts/6_build_teacher_v2.py scripts/7_evaluate_state_actions.py \
+  scripts/utils.py -type f -print0 \
+  | sort -z | xargs -0 sha256sum \
+  > results/round2/artifact_sha256.txt
+
+{ git rev-parse HEAD; git status --short; \
+  /root/miniconda3/envs/care-infer/bin/python --version; \
+  conda run --no-capture-output -p /root/autodl-tmp/envs/care-train \
+    llamafactory-cli version; \
+  nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used \
+    --format=csv,noheader; \
+} > results/round2/server_metadata.txt
+
+tar -czf /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz \
+  data/round2 runs/round2 results/round2 \
+  config/dpo_teacher_v2.yaml config/merge_teacher_v2.yaml \
+  tasks/teacher_v2_specs.jsonl tasks/holdout_v2.jsonl \
+  experiments/round2 scripts/1_run_baseline.py \
+  scripts/4_to_llamafactory.py scripts/5_evaluate.py \
+  scripts/6_build_teacher_v2.py scripts/7_evaluate_state_actions.py \
+  scripts/utils.py
+
+sha256sum /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz
+tar -tzf /root/autodl-tmp/care-agent-evidence-round2-20260903.tar.gz | wc -l
+```
+
+实验实际归档包大小 144 KB、52 个 entry，SHA-256 为 `590974ca8bad782eb957b10c06e40f44429c96b02750a4016ab34f534408483c`。通过 Jupyter 文件管理器或交互式 `scp` 下载；不要把密码写进 shell 命令或日志。
 
 ## 截止日前止损顺序
 

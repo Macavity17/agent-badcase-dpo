@@ -2,7 +2,7 @@
 
 ## 状态
 
-数据已完成构造、逐条人工复核与本地校验，尚未用于训练或评测。任何第二轮效果数字都必须在实际运行后填写，不能从数据质量推断。
+数据已完成构造、逐条人工复核、服务器重建与校验，并已用于第二轮 LoRA-DPO 和预注册三级评测。结果是 reward 分离改善，但状态决策和端到端完成率均未改善；不宣称 uplift。
 
 ## 目标
 
@@ -55,7 +55,15 @@
 
 `tasks/holdout_v2.jsonl` 包含 9 个新任务，三类 stress 各 3 条。患者 ID 为 `P9601-P9803`，9 个 `scenario_family` 均不与 train、dev 或第一份 holdout 重合。
 
-除字段、checker 引用、平衡与隔离外，每个 holdout 还生成了一条无占位符的 canonical trace 并通过 checker。但它从未用 base 或 DPO 模型运行，也未根据模型表现修改。它是模型未见的作者合成评测集，不是外部公开 benchmark。
+除字段、checker 引用、平衡与隔离外，每个 holdout 还生成了一条无占位符的 canonical trace 并通过 checker。它在冻结后才用 base 和 DPO 模型运行，未根据任一模型表现修改。它是模型未见的作者合成评测集，不是外部公开 benchmark。
+
+## 实际训练与评测结果
+
+- 训练：52 train / 14 task-grouped eval，3 epoch，21 steps，82.897 秒；train loss `0.672958`，eval loss `0.666803`，eval reward accuracy `0.928571`，reward margin `0.054155`。
+- 状态决策：14 pair row / 3 个独立任务，Base/DPO next-action accuracy 均为 14.3%，工具名均为 50.0%，精确参数均为 0.0%，final task checker 均为 33.3%，grounding 均为 16.7%，API error 为 0。
+- 端到端：9 个独立 `holdout_v2` 任务、27 条对齐轨迹，Base/DPO 均为 0/27，三类 stress 均为 0/9；工具调用率均 100%，协议错误均 0%。
+
+这符合预注册的“reward 改善、状态动作不改善”情形：本数据能让模型更好区分小样本偏好，但这一分离没有迁移到自由 next-action 或长轨迹任务完成。轨迹中同时存在局部正变化和新回归，所以不能宣称该数据产生了 Agent uplift。
 
 ## 预注册评测协议
 
@@ -114,6 +122,9 @@ teacher_v2_specs.jsonl                  9fc9f65175e7fadcf96b0be63cc1ad226a1741d8
 holdout_v2.jsonl                        78d6cc68b8954c6bc9c3ded1daf6a71a129ee3daf8397bfa48bcc963b21769b9
 pair_review.jsonl                       862b459fe5874fd57cf4b09178f0ac0f2c8a34fe9614bf0233d2739f7143f827
 split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187a4568a349ed1109558680cc7
+round-2 adapter                         118de03d6e09054e99f0b66a1f06fd79971a973786ba9949f417504cb495cbfb
+round-2 merged model                    840751b37a0bbad3a51e51c27ea574a3e716a992ba8b49cd4605f448c07fb9ea
+round-2 evidence archive                590974ca8bad782eb957b10c06e40f44429c96b02750a4016ab34f534408483c
 ```
 
 `data/` 被 Git 忽略，训练数据和 audit 文件需随实验 evidence archive 备份；teacher 规范、审阅清单、切分、holdout 和本数据卡进入 Git。
@@ -125,4 +136,5 @@ split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187
 - 不同任务的 pair 数不均衡，eval 仅 3 个独立任务；reward accuracy 只是训练诊断，不是效果结论。
 - 状态决策仍来自合成 train-domain 任务的 task-isolated eval，能诊断迁移但不是独立公开 benchmark，也不能替代完整轨迹。
 - 多轮 ShareGPT 角色与工具 schema 已对齐运行时语义，但 LLaMA-Factory/Qwen 模板与 vLLM/OpenAI 协议的底层 token 仍不保证逐 token 完全同构。
-- 只有实际训练并在固定 holdout-v2 上比较后，才能判断它是否修复第一轮退化。
+- 本轮只训练一个 seed 和一组超参；负结果不能外推为 DPO 在其他数据、模型或任务上无效。
+- 状态评测的字面 grounding/checker 会把部分语义等价表达判为错误，因此必须与轨迹人工审计一起解释。
