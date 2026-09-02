@@ -828,3 +828,18 @@ for row in rows:
     print(' final:', row['final_answer'][:500].replace('\n', ' '))
 PY
 ```
+
+### A.15 主动结束本次 SSH 会话
+
+```bash
+exit
+```
+
+实际输出：
+
+```text
+logout
+Connection closed.
+```
+
+该命令只关闭交互式 SSH。AutoDL 实例仍运行和计费，使用 `nohup ... &` 启动的 vLLM 不随该会话退出。
