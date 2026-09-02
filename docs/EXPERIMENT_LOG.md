@@ -1737,3 +1737,25 @@ git diff --check
 ```
 
 结果：18 个单测全部通过；Python 编译无错误；24 条主任务与 9 条 holdout-v2 均通过字段、checker 引用和场景隔离校验；`git diff --check` 无输出。本阶段没有再启动模型、训练或修改 holdout/checker。
+
+### 提交、GitHub 与服务器文档同步
+
+Git 身份核对为 `王培轩 <paxonw@163.com>`。结果文档提交为 `15d9829` (`docs: record round two negative transfer result`)，5 个文件共 340 行新增、11 行删除。Mac 到 GitHub 推送成功：
+
+```bash
+git push --verbose origin main
+```
+
+远端从 `3939e72` 快进到 `15d9829`。随后服务器执行：
+
+```bash
+git pull --ff-only origin main
+```
+
+这次服务器到 GitHub 的网络正常，收到 10 个对象并从 `2339b9f` 快进到 `15d9829`；仅更新 README、数据卡、指南、日志和 round-two manifest，未修改被 Git 忽略的数据、模型、训练日志或证据包。
+
+为将本小节本身同步给服务器，本节提交并推送后服务器只再执行下面这一条预登记命令，之后不再执行其他服务器 shell 命令：
+
+```bash
+git pull --ff-only origin main
+```
