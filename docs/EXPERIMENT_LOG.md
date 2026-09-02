@@ -17,6 +17,8 @@ Last updated: 2026-09-02 (Asia/Shanghai)
 - 对结果的归因、决策与下一步；
 - 如果失败，明确标记 `FAILED` 或 `INVALID FOR CONCLUSION`，不覆盖原结果。
 
+对服务器的每一条 shell 命令都要进入文末的完整命令账本，包括诊断、等待、查看日志、失败命令和重试；不只记录最终成功的主流程命令。
+
 不记录 SSH 密码、API key、Token 或其他凭据。
 
 ## 2026-09-02 / Run 0：本地代码与数据准备
@@ -405,7 +407,7 @@ OK
 ### 推送状态：`BLOCKED BY LOCAL NETWORK`
 
 - 第一次推送返回：`Could not resolve host: github.com`。
-- 后续推送未完成；本地 `main` 比 `origin/main` 领先 3 个待推送提交：layered v2 代码修复、实验日志与记录协议，以及本条推送状态纠正。
+- 后续推送未完成；本地 `main` 比 `origin/main` 领先 4 个待推送提交：layered v2 代码修复、实验日志与记录协议、推送状态纠正，以及服务器完整命令账本。
 - 服务器仍在 `1f87b2a`，尚未获得 layered v2 修复。
 - 等用户切换本地网络后，再推送并让服务器 `git pull --ff-only origin main`。
 
@@ -434,3 +436,178 @@ OK
 - 服务器 pull 前后 commit。
 - layered v2 完整命令、输出文件、27 条行数、0 服务错误检查、完成率、分类完成率和 token 峰值。
 - 是保留任务集还是进行难度校准的明确决策与依据。
+
+## 附录 A：2026-09-02 服务器完整命令账本
+
+以下清单根据本次仍在线的 SSH shell 中 `history` 的 69 条记录还原，并与 Agent 工具调用输出交叉核对。编号代表实际执行顺序。
+
+登录命令在本地终端执行，不属于服务器 shell history：
+
+```bash
+ssh -p <AUTODL_PORT> root@<AUTODL_HOST>
+```
+
+AutoDL 端口和主机名是实例级动态连接信息，不写入公开仓库。SSH 密码从未作为 shell 命令执行，也不记录。
+
+### A.1 初始环境检查与仓库克隆（history 1-11）
+
+```bash
+nvidia-smi
+python3 --version
+conda --version
+git --version
+df -h / /root/autodl-tmp
+cd /root/autodl-tmp
+if [ -f /etc/network_turbo ]; then source /etc/network_turbo; fi
+ls -la
+git clone https://github.com/Macavity17/agent-badcase-dpo.git
+cd agent-badcase-dpo
+git log -1 --oneline --decorate
+```
+
+### A.2 Conda 环境、依赖与服务器校验（history 12-21）
+
+```bash
+eval "$(conda shell.bash hook)"
+conda create -n care-infer python=3.11 -y
+eval "$(conda shell.bash hook)"
+conda activate care-infer
+python --version
+python -m pip install --upgrade pip
+python -m pip install "openai>=1.40" "vllm>=0.6.0" "huggingface_hub[cli]>=0.24"
+python -c 'import torch, vllm, openai; print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available()); print("gpu", torch.cuda.get_device_name(0)); print("vllm", vllm.__version__, "openai", openai.__version__)'
+python scripts/0_validate_tasks.py
+python -m unittest discover -s tests -v
+```
+
+### A.3 模型下载与产物检查（history 22-25）
+
+```bash
+mkdir -p models runs
+hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir ./models/Qwen2.5-1.5B-Instruct
+du -sh models/Qwen2.5-1.5B-Instruct
+ls -lh models/Qwen2.5-1.5B-Instruct/*.safetensors
+```
+
+`hf download` 实际执行了两次：第一次在主权重下载后因 `RemoteProtocolError` 退出，第二次使用完全相同的命令续传成功。当前 shell 对连续重复命令进行了历史去重，所以 `history` 只显示一条；Agent 执行记录明确包含两次调用。
+
+### A.4 vLLM 启动与第一轮就绪诊断（history 26-32）
+
+```bash
+nohup python3 -m vllm.entrypoints.openai.api_server --model ./models/Qwen2.5-1.5B-Instruct --served-model-name base --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/vllm_base.log 2>&1 &
+echo $! > runs/vllm_base.pid
+cat runs/vllm_base.pid
+sleep 8
+ps -p "$(cat runs/vllm_base.pid)" -o pid,stat,cmd
+curl -sS http://localhost:8000/v1/models
+tail -n 120 runs/vllm_base.log
+```
+
+此处 `curl` 返回 connection refused，后续 `tail` 证明服务正在加载模型和编译，不是进程退出。
+
+### A.5 vLLM 第二轮就绪诊断（history 33-41）
+
+```bash
+sleep 20
+curl -sS http://localhost:8000/v1/models
+ps -p "$(cat runs/vllm_base.pid)" -o pid,stat,cmd
+tail -n 120 runs/vllm_base.log
+date
+ss -ltnp | grep 8000 || true
+ps -ef | grep -E 'vllm|EngineCore' | grep -v grep
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+curl -sS http://localhost:8000/v1/models
+```
+
+该轮关键输出：
+
+- 两次 `curl localhost` 仍在服务就绪前返回 connection refused。
+- `ss` 命令失败：`ss: command not found`。
+- `ps` 显示 API server 和 `VLLM::EngineCore` 进程均存活。
+- `nvidia-smi` 显示 EngineCore 已占用约 20,874 MiB GPU 内存。
+
+### A.6 vLLM 第三轮诊断与成功健康检查（history 42-46）
+
+```bash
+sleep 20
+tail -n 30 runs/vllm_base.log
+ps -o pid,stat,pcpu,pmem,etime,wchan:30 -p 2617,2704
+cat /proc/2617/net/tcp
+curl -sS http://127.0.0.1:8000/v1/models
+```
+
+`/proc/2617/net/tcp` 中出现 `00000000:1F40`，`1F40` 为十六进制端口 8000。最后一条 `curl 127.0.0.1` 成功返回 `base` 模型。PID 是本次 run 的动态值，复现时应从 `runs/vllm_base.pid` 和实际子进程获取，不应复制固定 PID。
+
+### A.7 冒烟测试与轨迹展开（history 47-48）
+
+```bash
+python3 scripts/1_run_baseline.py --split test --limit 1 --strategy full --repeats 1 --base-url http://127.0.0.1:8000/v1 --out data/smoke.jsonl --verbose
+python -m json.tool data/smoke.jsonl
+```
+
+### A.8 81 条上下文对照、报告与完整性检查（history 49-53）
+
+```bash
+for strategy in full window layered; do
+  python3 scripts/1_run_baseline.py --split test --strategy "$strategy" --repeats 3 --temperature 0.2 --seed 42 --workers 4 --base-url http://127.0.0.1:8000/v1 --out "data/test_${strategy}.jsonl" --resume
+done
+python3 scripts/5_evaluate.py --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl --out results/context_compare.md
+sed -n '1,220p' results/context_compare.md
+wc -l data/test_full.jsonl data/test_window.jsonl data/test_layered.jsonl
+grep -n '"type": "error"' data/test_*.jsonl || true
+```
+
+### A.9 badcase 结构化诊断（history 54-56）
+
+```bash
+command -v jq || true
+python - <<'PY'
+import json
+from collections import Counter, defaultdict
+for strategy in ('full','window','layered'):
+    path=f'data/test_{strategy}.jsonl'
+    rows=[json.loads(line) for line in open(path)]
+    print('\n', strategy)
+    by=defaultdict(list)
+    for r in rows: by[r['task_id']].append(r)
+    for task_id, group in sorted(by.items()):
+        seqs=Counter('>'.join(c['name'] for c in r['tool_calls']) or '<none>' for r in group)
+        print(task_id, f"ok={sum(r['success'] for r in group)}/3", dict(seqs))
+PY
+python - <<'PY'
+import json
+rows=[json.loads(line) for line in open('data/test_full.jsonl')]
+for r in rows:
+    print('\n', r['task_id'], r['repeat'], 'success=', r['success'])
+    for c in r['tool_calls']:
+        print(' ', c['name'], c['args'])
+    print(' final:', r['final_answer'])
+PY
+```
+
+`command -v jq` 没有输出，因此使用 Python 的 JSON 解析器展开 JSONL，没有安装额外系统包。
+
+### A.10 环境、产物和服务证据补采（history 57-68）
+
+```bash
+hostname
+uname -srmo
+nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu --format=csv,noheader
+free -h
+df -h /root/autodl-tmp
+git rev-parse HEAD
+python -c 'import sys,torch,vllm,openai,huggingface_hub; print(sys.version.split()[0]); print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(vllm.__version__, openai.__version__, huggingface_hub.__version__)'
+sha256sum models/Qwen2.5-1.5B-Instruct/model.safetensors
+curl -sS http://127.0.0.1:8000/v1/models
+wc -l data/test_full.jsonl data/test_window.jsonl data/test_layered.jsonl
+grep -h -c '"type": "error"' data/test_full.jsonl data/test_window.jsonl data/test_layered.jsonl
+grep -E 'version 0.28.0|Resolved architecture|Using max model len|Loading weights took|Model loading took|Available KV cache|GPU KV cache size|Graph capturing finished|Application startup complete|Uvicorn running' runs/vllm_base.log
+```
+
+### A.11 shell 历史完整性检查（history 69）
+
+```bash
+history
+```
+
+此命令的输出是附录 A 的原始依据。自此开始，后续每次服务器操作都必须在同一次实验日志更新中追加精确命令、参数、关键输出和状态。
