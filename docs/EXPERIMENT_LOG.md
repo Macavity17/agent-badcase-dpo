@@ -1313,6 +1313,8 @@ e9ad0708ce2b2764053aa0a37e598fd4c5ccc0d08d8a9bf2dae109a6dfc88347  care-agent-evi
 git pull --ff-only origin main
 ```
 
+该 `git pull` 执行后约 90 秒没有任何输出，随后 SSH 连接被远端关闭，本地显示 `Connection to connect.cqa1.seetacloud.com closed by remote host` 和 `Broken pipe`。因此不猜测未返回的 pull 是否更新了 checkout；服务器最后可验证提交仍是 `52d1949`，Mac/GitHub 为包含本轮下载记录的 `8b38316`。差异仅为这份本地下载日志，不影响服务器模型、实验结果或已在 Mac 通过哈希校验的证据包。为避免在只剩非必要文档同步时继续消耗时间，未再重连服务器。
+
 第一次返回 `curl 16 Error in the HTTP2 framing layer`；第二次超过 90 秒无输出，手动 `Ctrl+C` 中断。没有执行第二轮数据构造或训练。
 
 本轮为确认固定在服务器的 LLaMA-Factory `0.9.6.dev0` 是否真正支持多轮工具偏好与显式 eval dataset，只读执行了以下全部 shell 命令：
