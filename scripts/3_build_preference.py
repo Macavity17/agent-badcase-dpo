@@ -8,11 +8,11 @@
 成本：50 条 × 2–3 次调用 ≈ 几十元。
 
 这是"合成数据生产"，也是岗位 JD 明确认可的动手项之一：
-数据从哪来、怎么保证 chosen 质量、rejected 截断到哪一步，都要能讲清楚。
+数据从哪来、怎么保证 chosen 质量、rejected 保留哪些失败证据，都要能讲清楚。
 
 质量红线：
-- chosen 必须真的满足 checker（脚本会验证，不通过的丢弃，别硬塞）；
-- rejected 截断到失败点，不要把无关尾巴也算进去；
+- chosen 必须同时通过工具协议校验与任务 checker（不通过即丢弃）；
+- rejected 保留能够呈现主失败原因的完整响应轨迹；
 - 合成数据占比要在 README 里如实写，别包装成"人工标注数据"。
 """
 
@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import check_completion, get_client, load_jsonl, save_jsonl
@@ -38,6 +39,9 @@ SYNTH_PROMPT = """你是 Agent 轨迹修复专家。下面是一个失败的执�
 ## 失败轨迹（供参考，找出它错在哪）
 {failed}
 
+## 模拟环境的确定性工具返回
+{mock_responses}
+
 ## 输出要求
 严格输出 JSON，不要任何解释文字、不要 markdown 代码块：
 {{
@@ -50,17 +54,36 @@ SYNTH_PROMPT = """你是 Agent 轨迹修复专家。下面是一个失败的执�
 规则：
 1. steps 里只放必要的工具调用，最多 {max_steps} 步；
 2. 工具名和参数名必须严格来自上面的可用工具列表；
-3. final_answer 必须体现所有约束（如预算上限、禁忌、单位、称呼）。"""
+3. 关键约束可能出现在工具返回中，final_answer 必须保留这些约束。"""
 
 
 def render_steps(steps):
     lines = []
     for s in steps or []:
         if s.get("tool"):
-            lines.append(f"[{s.get('step')}] CALL {s['tool']}({json.dumps(s.get('args') or {}, ensure_ascii=False)})")
+            lines.append(render_tool_call(s["tool"], s.get("args") or {}))
         elif s.get("type") == "final":
-            lines.append(f"FINAL: {s.get('content')}")
+            lines.append(s.get("content") or "")
     return "\n".join(lines) or "(无有效步骤)"
+
+
+def render_tool_call(name, args):
+    payload = {"name": name, "arguments": args}
+    return "<tool_call>\n" + json.dumps(payload, ensure_ascii=False) + "\n</tool_call>"
+
+
+def validate_synth_steps(task, steps):
+    tools = {t["name"]: set((t.get("args") or {}).keys()) for t in (task.get("tools") or [])}
+    if not steps:
+        return False, "steps 为空"
+    for step in steps:
+        name = step.get("tool")
+        args = step.get("args") or {}
+        if name not in tools:
+            return False, f"调用了未声明工具 {name}"
+        if set(args) != tools[name]:
+            return False, f"{name} 参数键不匹配：期望 {sorted(tools[name])}，实际 {sorted(args)}"
+    return True, "工具协议通过"
 
 
 def synth_chosen(client, model, task, traj):
@@ -75,6 +98,7 @@ def synth_chosen(client, model, task, traj):
         constraints="\n".join(f"- {c}" for c in cons) or "(无)",
         tools=tools_desc,
         failed=render_steps(traj.get("steps"))[:2000],
+        mock_responses=json.dumps(task.get("mock_responses") or {}, ensure_ascii=False),
         max_steps=int(task.get("max_steps", 8)),
     )
     try:
@@ -90,25 +114,29 @@ def synth_chosen(client, model, task, traj):
         obj = json.loads(txt[s:e + 1])
         steps = obj.get("steps") or []
         final = obj.get("final_answer") or ""
+        protocol_ok, protocol_info = validate_synth_steps(task, steps)
+        if not protocol_ok:
+            return None, protocol_info
         # 校验：chosen 必须真的能过 checker，否则丢弃（宁缺毋滥）
         pseudo = {"tool_calls": [{"name": x.get("tool"), "args": x.get("args") or {}} for x in steps],
                   "final_answer": final}
         ok = check_completion(task, pseudo)
-        text = render_steps_from_synth(steps) + f"\nFINAL: {final}"
-        return text, (ok, "checker 通过" if ok else "checker 未通过，已丢弃")
+        text = render_steps_from_synth(steps) + f"\n{final}"
+        return {
+            "text": text,
+            "steps": steps,
+            "final_answer": final,
+        }, (ok, "checker 通过" if ok else "checker 未通过，已丢弃")
     except Exception as ex:
         return None, f"调用/解析失败：{ex}"
 
 
 def render_steps_from_synth(steps):
-    return "\n".join(
-        f"[{i+1}] CALL {x.get('tool')}({json.dumps(x.get('args') or {}, ensure_ascii=False)})"
-        for i, x in enumerate(steps)
-    )
+    return "\n".join(render_tool_call(x.get("tool"), x.get("args") or {}) for x in steps)
 
 
-def truncate_rejected(traj):
-    """rejected：截断到失败点（最后一个工具调用），避免把发散的尾巴也算进去。"""
+def render_rejected(traj):
+    """保留能呈现主失败原因的完整轨迹，供 response-level DPO 比较。"""
     return render_steps(traj.get("steps"))
 
 
@@ -119,6 +147,8 @@ def main():
     ap.add_argument("--out", default="data/pref_pairs.jsonl")
     ap.add_argument("--model", default=os.environ.get("SYNTH_MODEL", "deepseek-chat"))
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
     tasks = {t["task_id"]: t for t in load_jsonl(args.tasks)}
@@ -127,31 +157,48 @@ def main():
         bad = bad[: args.limit]
 
     client = get_client()
-    pairs, dropped = [], 0
+    pairs = load_jsonl(args.out) if args.resume and os.path.exists(args.out) else []
+    done = {(p.get("task_id"), p.get("source_repeat", 0)) for p in pairs}
+    pending = [b for b in bad if (b.get("task_id"), b.get("repeat", 0)) not in done]
+    dropped = 0
 
-    for b in bad:
+    def build_one(b):
         task = tasks.get(b.get("task_id"))
         if task is None:
-            continue
+            return b, None, "任务定义不存在"
         chosen, info = synth_chosen(client, args.model, task, b)
-        if chosen is None or info is True or (isinstance(info, tuple) and not info[0]):
-            dropped += 1
-            print(f"[{b.get('task_id')}] 丢弃：{info}")
-            continue
-        pairs.append({
+        if chosen is None or (isinstance(info, tuple) and not info[0]):
+            return b, None, info
+        return b, {
             "task_id": b.get("task_id"),
+            "scenario_family": b.get("scenario_family"),
             "stress": b.get("stress"),
             "attr_label": b.get("attr_label"),
+            "source_repeat": b.get("repeat", 0),
             "prompt": b.get("prompt"),
-            "chosen": chosen,
-            "rejected": truncate_rejected(b),
-        })
-        print(f"[{b.get('task_id')}] ✓ {b.get('attr_label')}")
+            "chosen": chosen["text"],
+            "chosen_steps": chosen["steps"],
+            "chosen_final_answer": chosen["final_answer"],
+            "rejected": render_rejected(b),
+        }, info
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(build_one, b) for b in pending]
+        for future in as_completed(futures):
+            b, pair, info = future.result()
+            if pair is None:
+                dropped += 1
+                print(f"[{b.get('task_id')}#{b.get('repeat', 0)}] 丢弃：{info}")
+                continue
+            pairs.append(pair)
+            pairs.sort(key=lambda p: (p.get("task_id", ""), p.get("source_repeat", 0)))
+            save_jsonl(pairs, args.out)
+            print(f"[{b.get('task_id')}#{b.get('repeat', 0)}] ✓ {b.get('attr_label')}")
 
     save_jsonl(pairs, args.out)
     print(f"\n生成偏好对 {len(pairs)} 条，丢弃 {dropped} 条（chosen 未通过 checker）")
-    if len(pairs) < 100:
-        print("⚠️ 少于 100 条，DPO 效果会很弱。建议：加任务量 / 每条任务多采样几个失败轨迹 / 人工补几条 chosen。")
+    if len(pairs) < 40:
+        print("⚠️ 少于 40 条，先把训练任务采样次数提高到 8；不得使用 test 轨迹补量。")
     print(f"已写入：{args.out}")
 
 

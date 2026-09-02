@@ -49,6 +49,7 @@ def build_tools_payload(tools):
                     "type": "object",
                     "properties": props,
                     "required": list(props.keys()),
+                    "additionalProperties": False,
                 },
             },
         })
@@ -85,14 +86,36 @@ def _check_one(check, traj):
                     return True
         return False
 
-    if ctype == "final_contains":
+    if ctype in {"final_contains", "final_contains_any"}:
         return any(v in final for v in (check.get("values") or []))
+
+    if ctype == "final_contains_all":
+        return all(v in final for v in (check.get("values") or []))
 
     if ctype == "final_not_contains":
         return not any(v in final for v in (check.get("values") or []))
 
+    if ctype == "tool_not_called":
+        forbidden = set(check.get("tools") or [])
+        return all(c.get("name") not in forbidden for c in calls)
+
+    if ctype == "tool_call_sequence":
+        expected = check.get("tools") or []
+        actual = [c.get("name") for c in calls]
+        pos = 0
+        for name in actual:
+            if pos < len(expected) and name == expected[pos]:
+                pos += 1
+        return pos == len(expected)
+
+    if ctype == "max_tool_calls":
+        return len(calls) <= int(check.get("value", 0))
+
     if ctype == "all":
         return all(_check_one(c, traj) for c in (check.get("checks") or []))
+
+    if ctype == "any":
+        return any(_check_one(c, traj) for c in (check.get("checks") or []))
 
     return False
 

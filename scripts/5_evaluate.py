@@ -4,10 +4,10 @@
     # 难度校准（只算完成率，不调 API，秒出）
     python scripts/5_evaluate.py --traj data/probe.jsonl --mode quick
 
-    # Phase 1：四种上下文策略对比（本实验的核心表）
+    # 上下文策略对比（本实验的核心表）
     python scripts/5_evaluate.py \
-        --files full=data/p1_full.jsonl,window=data/p1_window.jsonl,summary=data/p1_summary.jsonl,layered=data/p1_layered.jsonl \
-        --out results/phase1_compare.md
+        --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl \
+        --out results/context_compare.md
 
     # Phase 3：DPO 前后对比（含 judge，需配 OPENAI_API_KEY / OPENAI_BASE_URL）
     python scripts/5_evaluate.py --before data/p1_full.jsonl --after data/dpo_trajectories.jsonl --out results/phase3_compare.md
@@ -62,24 +62,39 @@ def load_tasks(path):
 
 def stats_one(tasks, trajs):
     ok, steps, by_mode = 0, [], defaultdict(lambda: [0, 0])
-    ctx = []
+    ctx, chars = [], []
+    evaluated, calls, invalid_calls, trajectories_with_calls = 0, 0, 0, 0
+    task_ids = set()
     for tr in trajs:
         task = tasks.get(tr.get("task_id"))
         if task is None:
             continue
+        evaluated += 1
+        task_ids.add(tr.get("task_id"))
         succ = bool(check_completion(task, tr))
         ok += succ
         steps.append(tr.get("n_steps") or 0)
-        ctx.append(tr.get("max_context_chars") or 0)
+        ctx.append(tr.get("max_prompt_tokens") or 0)
+        chars.append(tr.get("max_context_chars") or 0)
+        row_calls = tr.get("tool_calls") or []
+        calls += len(row_calls)
+        trajectories_with_calls += bool(row_calls)
+        invalid_calls += sum(
+            not c.get("valid_name", True) or not c.get("valid_args", True)
+            for c in row_calls
+        )
         mode = tr.get("stress") or "unknown"
         by_mode[mode][0] += succ
         by_mode[mode][1] += 1
-    n = len(trajs)
+    n = evaluated
     return {
-        "n": n, "success": ok,
+        "n": n, "tasks": len(task_ids), "success": ok,
         "rate": ok / n if n else 0,
         "avg_steps": statistics.mean(steps) if steps else 0,
         "avg_ctx": statistics.mean(ctx) if ctx else 0,
+        "avg_ctx_chars": statistics.mean(chars) if chars else 0,
+        "tool_call_rate": trajectories_with_calls / n if n else 0,
+        "invalid_call_rate": invalid_calls / calls if calls else 0,
         "by_mode": {k: (v[0] / v[1] if v[1] else 0, v[1]) for k, v in by_mode.items()},
     }
 
@@ -134,7 +149,8 @@ def md_table(headers, rows):
 
 def build_multi_report(groups, ordered_labels):
     lines = ["# Phase 1：上下文策略 × 失效模式 对照结果", ""]
-    lines.append(f"基线（full）样本 {groups[ordered_labels[0]]['n']} 条/策略。"
+    lines.append(f"基线（full）覆盖 {groups[ordered_labels[0]]['tasks']} 个任务、"
+                 f"{groups[ordered_labels[0]]['n']} 条轨迹/策略。"
                  "同一模型、同一任务集，只变上下文组织方式。")
     lines.append("")
 
@@ -143,7 +159,7 @@ def build_multi_report(groups, ordered_labels):
     for lb in ordered_labels:
         st = groups[lb]
         rows.append([lb, st["n"], f"{st['rate']:.1%}", f"{st['avg_steps']:.2f}", f"{st['avg_ctx']:.0f}"])
-    lines.append(md_table(["策略", "n", "完成率", "平均步数", "平均上下文峰值(字符)"], rows))
+    lines.append(md_table(["策略", "轨迹数", "完成率", "平均步数", "平均 prompt 峰值(tokens)"], rows))
     lines.append("")
 
     lines.append("## 2. 分类别完成率（核心表：策略 × 失效模式）")
@@ -163,9 +179,9 @@ def build_multi_report(groups, ordered_labels):
     for lb in ordered_labels:
         st = groups[lb]
         rows.append([lb, f"{st['avg_ctx']:.0f}", f"{st['rate']:.1%}"])
-    lines.append(md_table(["策略", "平均上下文峰值", "完成率"], rows))
+    lines.append(md_table(["策略", "平均 prompt 峰值(tokens)", "完成率"], rows))
     lines.append("")
-    lines.append("看什么：layered 是否做到了「上下文峰值接近 window/summary，但完成率显著更高」？"
+    lines.append("看什么：layered 是否做到了「上下文峰值接近 window，但完成率显著更高」？"
                  "如果是，这就是「分层组织优于朴素压缩」的直接证据（JD 原文论断的复现）。")
     lines.append("")
 
@@ -187,6 +203,10 @@ def build_before_after(before, after, b_judge=None, a_judge=None):
              f"{(after['rate'] - before['rate']) * 100:+.1f}pp"],
             ["平均步数", f"{before['avg_steps']:.2f}", f"{after['avg_steps']:.2f}",
              f"{after['avg_steps'] - before['avg_steps']:+.2f}"],
+            ["工具调用率", f"{before['tool_call_rate']:.1%}", f"{after['tool_call_rate']:.1%}",
+             f"{(after['tool_call_rate'] - before['tool_call_rate']) * 100:+.1f}pp"],
+            ["工具协议错误占比", f"{before['invalid_call_rate']:.1%}", f"{after['invalid_call_rate']:.1%}",
+             f"{(after['invalid_call_rate'] - before['invalid_call_rate']) * 100:+.1f}pp"],
         ],
     ))
     lines.append("")

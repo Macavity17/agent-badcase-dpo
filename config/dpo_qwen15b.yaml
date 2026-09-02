@@ -19,6 +19,7 @@ pref_loss: sigmoid      # sigmoid=DPO；也可试 hinge / ipo / kto_pair
 
 ### dataset
 dataset: agent_pref     # ← 对应 dataset_info.json 里的 key
+dataset_dir: ./LLaMA-Factory/data
 template: qwen
 cutoff_len: 2048        # agent 轨迹较长，必要时调到 4096
 max_samples: 2000
@@ -27,14 +28,15 @@ preprocessing_num_workers: 8
 
 ### output
 output_dir: ./outputs/dpo-qwen15b
-logging_steps: 5
-save_steps: 100
+logging_steps: 2
+save_steps: 5
+save_total_limit: 2
 plot_loss: true
 overwrite_output_dir: true
 
 ### train
 per_device_train_batch_size: 2
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 learning_rate: 5.0e-6
 num_train_epochs: 3.0
 lr_scheduler_type: cosine
@@ -43,17 +45,8 @@ bf16: true
 gradient_checkpointing: true
 
 ### eval
-val_size: 0.05
+val_size: 0.1
 per_device_eval_batch_size: 2
 eval_strategy: steps
-eval_steps: 50
+eval_steps: 5
 load_best_model_at_end: true
-
-# —— 合并 LoRA 权重用的 export 配置（merge_lora.yaml）——
-# model_name_or_path: ./models/Qwen2.5-1.5B-Instruct
-# adapter_name_or_path: ./outputs/dpo-qwen15b
-# template: qwen
-# finetuning_type: lora
-# export_dir: ./outputs/dpo_merged
-# export_size: 4
-# export_legacy_format: false

@@ -1,53 +1,39 @@
-# 任务集设计说明
+# 合成慢病照护任务规范
 
-自建 30–50 个轻量 tool-use 任务（当前 `tasks.jsonl` 有 12 个样例，照格式扩到 30–50）。
+任务模拟照护运营平台中的信息读取、记录、提醒、内容投递与人工升级，不模拟诊断、处方或真实医疗决策。全部患者、记录和工具返回均为合成数据。
 
-## 设计原则：场景贴岗位，难度可校准
+## 数据划分
 
-**场景全部选办公 / 差旅 / 数据 / 金融类**——正对目标岗位描述的用户群（"办公、金融、法律、医疗等场景中的专业工作者"）。这不是凑巧，是让面试官一眼看出我理解他们的产品场景。
+- `train`：15 条，用于多次采样失败轨迹和构造 DPO 偏好对。
+- `test`：9 条，只用于上下文策略与 DPO 前后评测。
+- 三类失效在两个 split 内均衡分布。
+- `scenario_family` 不跨 split，避免只更换患者 ID 和数字造成模板泄漏。
 
-**每类失败模式定向设计**，对应岗位 JD 的三大课题：
+## 主要字段
 
-| 前缀 | 失败模式 | 对应 JD 课题 | 设计手法 |
-|---|---|---|---|
-| `tm_` | **tool_misuse** 工具误选 | 工具体系设计、Function Calling 协议 | 放 3–4 个名字/参数相近的工具，只有一个正确 |
-| `cf_` | **context_forgetting** 上下文遗忘 | 上下文分层与预算分配、记忆管理 | 任务开头给一个约束（预算/禁忌/格式），中后期必须用到 |
-| `pd_` | **planning_drift** 规划发散 | 任务规划与 Subagent 协作、反思收敛 | 3–5 步串联 + 条件分支，诱导模型循环或跑偏 |
+| 字段 | 含义 |
+|---|---|
+| `task_id` | 唯一任务 ID |
+| `split` | `train` 或 `test` |
+| `scenario_family` | 工作流家族，用于检查训练测试隔离 |
+| `stress` | `tool_misuse` / `context_forgetting` / `planning_drift` |
+| `goal` | 模型可见的用户目标 |
+| `constraints` | 模型在初始请求中可见的约束 |
+| `latent_constraints` | 仅用于设计审计；相关事实由工具观测暴露，不传给被测模型 |
+| `tools` | OpenAI Function Calling 工具定义 |
+| `mock_responses` | 确定性的合成工具返回 |
+| `checker` | 规则完成判定 |
+| `expected_steps` / `max_steps` | 正常步数与运行上限 |
 
-## JSON 字段
+## Checker
 
-```jsonc
-{
-  "task_id": "tm_001",
-  "stress": "tool_misuse",                 // 三类之一，用于后续分类别统计
-  "goal": "帮我订 9 月 10 日北京到上海最早的航班",
-  "constraints": ["只要上午起飞的"],         // 早期约束，cf_ 类必填
-  "tools": [
-    {"name": "search_flight", "desc": "查询航班", "args": {"from": "出发城市", "to": "到达城市", "date": "日期"}},
-    {"name": "search_train",  "desc": "查询火车", "args": {...}}
-  ],
-  "mock_responses": {                      // 工具的假返回，让模型能"跑通"流程
-    "search_flight": {"flights": [{"no": "CA1501", "dep": "08:00", "price": 1180}]}
-  },
-  "checker": {                             // 完成判定（规则，可自动跑）
-    "type": "tool_call",
-    "expect_tool": "search_flight",
-    "expect_args_contains": {"date": "2026-09-10"}
-  },
-  "expected_steps": 2,                     // 用于判定 planning_drift（超 2 倍即发散）
-  "max_steps": 8
-}
-```
+- `tool_call`：调用指定工具，参数包含预期键值。
+- `tool_not_called`：没有调用高风险或错误工具。
+- `tool_call_sequence`：关键工具按顺序出现，允许中间存在其他调用。
+- `max_tool_calls`：限制冗余调用。
+- `final_contains_any` / `final_contains`：最终答复包含任一关键词。
+- `final_contains_all`：最终答复包含全部关键词。
+- `final_not_contains`：最终答复不得出现敏感或错误内容。
+- `all` / `any`：组合 checker。
 
-### checker 类型
-
-- `tool_call`：最终调用了 `expect_tool`，且参数包含 `expect_args_contains` 里的键值
-- `final_contains`：最终答案文本必须包含 `values` 中任一项（检验约束是否被遵守，如"避开海鲜"）
-- `final_not_contains`：最终答案**不得**包含（如给过敏用户推荐了海鲜）
-- `all`：`checks` 数组里的多个条件全部满足
-
-## 扩充时的三条纪律
-
-1. **每类至少 12–15 条**，否则分类别统计没意义
-2. **mock_responses 要写具体**（航班号、价格、日期），模型才有可能"正确"完成——敷衍的假数据只会让轨迹全是噪声
-3. **先跑 10 条校准难度**（见 QUICKSTART 第 6 步），完成率目标 30–50%，再全量扩
+运行 `python3 scripts/0_validate_tasks.py` 检查字段、工具引用、类别平衡和场景族泄漏。

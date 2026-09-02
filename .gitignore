@@ -27,5 +27,9 @@ vllm.log
 *.token
 credentials*
 
+# ---- OneDrive 同步的本地 Agent 接力文件（不对外发布）----
+AGENTS.md
+PROJECT_MEMORY.md
+
 # ---- 系统/编辑器 ----
 .DS_Store

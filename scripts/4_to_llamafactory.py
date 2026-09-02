@@ -17,16 +17,19 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import load_jsonl, save_jsonl, write_text
+from utils import load_jsonl
 
 DATASET_NAME = "agent_pref"
+TRAINING_SYSTEM = (
+    "你是慢病照护运营助手。你只能使用给定工具完成信息读取、记录、提醒和人工升级；"
+    "不得诊断、开药或自行修改处方。执行时必须保留患者约束，完成必要闭环后立即停止。"
+)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pref", default="data/pref_pairs.jsonl")
     ap.add_argument("--outdir", default="data/lf_data")
-    ap.add_argument("--val-ratio", type=float, default=0.05)
     args = ap.parse_args()
 
     pairs = load_jsonl(args.pref)
@@ -42,6 +45,7 @@ def main():
             "conversations": [{"from": "human", "value": p.get("prompt") or ""}],
             "chosen": {"from": "gpt", "value": p["chosen"]},
             "rejected": {"from": "gpt", "value": p["rejected"]},
+            "system": TRAINING_SYSTEM,
         })
 
     out_path = os.path.join(args.outdir, f"{DATASET_NAME}.json")
@@ -57,6 +61,7 @@ def main():
                 "messages": "conversations",
                 "chosen": "chosen",
                 "rejected": "rejected",
+                "system": "system",
             },
         }
     }

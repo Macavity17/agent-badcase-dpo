@@ -1,8 +1,8 @@
 """Step 2 — badcase 归因：把失败轨迹分到三类（对齐岗位三大课题）。
 
 用法：
-    python scripts/2_attribute.py --traj data/baseline_trajectories.jsonl --out data/badcases_labeled.jsonl
-    python scripts/2_attribute.py --traj data/baseline_trajectories.jsonl --use-judge   # 用强模型复核
+    python3 scripts/2_attribute.py --traj data/train_full.jsonl --out data/badcases_labeled.jsonl
+    python3 scripts/2_attribute.py --traj data/train_full.jsonl --use-judge
 
 三类定义（写 README 时可直接引用）：
 - tool_misuse        工具误选：调用了不存在的工具名、参数缺失/多余、或选了与任务无关的相似工具
@@ -23,7 +23,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import format_trajectory, get_client, load_jsonl, save_jsonl, tool_names
+from utils import check_completion, format_trajectory, get_client, load_jsonl, save_jsonl, tool_names
 
 LABELS = ["tool_misuse", "context_forgetting", "planning_drift"]
 
@@ -68,12 +68,19 @@ def rule_attribute(task, traj):
                 missing = [k for k in required if k not in (c.get("args") or {})]
                 if missing:
                     arg_errors.append(f"{t['name']} 缺少参数 {missing}")
+                extra = [k for k in (c.get("args") or {}) if k not in required]
+                if extra:
+                    arg_errors.append(f"{t['name']} 包含未声明参数 {extra}")
     if arg_errors:
         evidence.extend(arg_errors[:3])
         return "tool_misuse", evidence
 
+    if task.get("stress") == "tool_misuse" and not check_completion(task, traj):
+        evidence.append("未完成任务要求的目标工具调用，可能选择了相似但错误的工具")
+        return "tool_misuse", evidence
+
     # ---- 3) context_forgetting：有约束但最终答案没体现/违反了 ----
-    cons = task.get("constraints") or []
+    cons = (task.get("constraints") or []) + (task.get("latent_constraints") or [])
     if cons:
         # 用 checker 里的 final_not_contains 反推：命中即说明违反了约束
         chk = task.get("checker") or {}
@@ -93,6 +100,10 @@ def rule_attribute(task, traj):
             evidence.append(f"约束中的关键信息 {nums} 未出现在最终答案里")
             return "context_forgetting", evidence
 
+        if task.get("stress") == "context_forgetting" and not check_completion(task, traj):
+            evidence.append("轨迹未通过面向约束遵守设计的任务 checker")
+            return "context_forgetting", evidence
+
     # ---- 兜底：按任务设计的 stress 类型标注（弱证据，README 里要说明）----
     evidence.append("规则未捕捉到明确信号，按任务设计类型标注（弱证据，人工复核后再用于训练）")
     return task.get("stress", "unknown"), evidence
@@ -103,7 +114,8 @@ def judge_attribute(task, traj, client, model):
     prompt = f"""你是 Agent 失败归因专家。下面是任务、可用工具、以及模型的执行轨迹。
 
 任务：{task.get('goal')}
-约束：{task.get('constraints') or []}
+显式约束：{task.get('constraints') or []}
+由环境观测暴露、仅供评审使用的约束：{task.get('latent_constraints') or []}
 可用工具：{[t['name'] for t in (task.get('tools') or [])]}
 
 执行轨迹：
@@ -131,11 +143,12 @@ def judge_attribute(task, traj, client, model):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--traj", default="data/baseline_trajectories.jsonl")
+    ap.add_argument("--traj", default="data/train_full.jsonl")
     ap.add_argument("--tasks", default="tasks/tasks.jsonl")
     ap.add_argument("--out", default="data/badcases_labeled.jsonl")
     ap.add_argument("--use-judge", action="store_true", help="用强模型复核归因")
     ap.add_argument("--judge-model", default=os.environ.get("JUDGE_MODEL", "deepseek-chat"))
+    ap.add_argument("--include-errors", action="store_true", help="包含 API/服务错误轨迹（默认排除）")
     args = ap.parse_args()
 
     tasks = {t["task_id"]: t for t in load_jsonl(args.tasks)}
@@ -144,10 +157,12 @@ def main():
 
     rows, dist = [], Counter()
     for tr in trajs:
-        if tr.get("success"):
+        if check_completion(tasks.get(tr.get("task_id"), {}), tr):
             continue  # 只归因失败样本
         task = tasks.get(tr.get("task_id"))
         if task is None:
+            continue
+        if not args.include_errors and any(s.get("type") == "error" for s in (tr.get("steps") or [])):
             continue
 
         label, evidence = rule_attribute(task, tr)
@@ -166,7 +181,7 @@ def main():
             "prompt": task["goal"] + (
                 "\n\n约束条件（必须遵守）：\n" + "\n".join(f"- {c}" for c in (task.get("constraints") or []))
                 if task.get("constraints") else ""
-            ),
+            ) + "\n\n可用工具定义：\n" + json.dumps(task.get("tools") or [], ensure_ascii=False),
         })
 
     save_jsonl(rows, args.out)

@@ -1,66 +1,151 @@
-# Context Strategy vs. Training-based Correction
+# Care Agent Failure Lab
 
-> 一句话：从 badcase 归因出发，量化"**上下文组织**"与"**训练矫正（DPO）**"对 Agent 三类典型失效的**修复边界**。
-> **实验正式名称**：Context Strategy vs. Training-based Correction: An Empirical Study on Agent Failure Modes
+> 一个慢病照护 Agent 的独立受控实验：上下文分层与 DPO 分别能修复哪类长程失效？
 
-## 为什么做这个
+## 项目背景
 
-目标岗位 JD 原文：
+在既往慢病照护 Agent 实践中，我参与过模型选型、event-memory、badcase 数据分析与自动化评测。一个反复出现的问题是：相似的失败表象，根因可能完全不同。有些来自早期约束在长链路中丢失，有些来自模型对相似工具的选择偏差，还有些来自规划循环不收敛。它们不应该默认用同一种手段修复。
 
-> 同一个模型，上下文组织方式不同，长任务的完成率会有数倍差距……核心工作是智能体运行策略：上下文的分层、筛选与压缩；记忆的写入、召回与失效；工具体系设计；规划与反思的收敛。工作方式是从线上 badcase 出发完成归因、提出假设、设计实验并验证效果。
+因此，我在实习结束后独立构建了这个 controlled pilot，研究三个问题：
 
-这个实验做两件事：
-1. 把"上下文组织决定完成率"从论断变成**我自己的实验证据**；
-2. 比它多走一步——量化"**上下文策略治不了的部分**"能否用训练（DPO）补上、边界在哪。
+1. 滑动窗口丢失早期关键观测时，结构化事件记忆能否恢复完成率？
+2. 上下文组织难以修复的工具选择偏差，能否通过小规模 LoRA-DPO 改善？
+3. 两种干预对 `tool_misuse`、`context_forgetting`、`planning_drift` 的作用边界是否不同？
 
-## ⚠️ 诚实边界（面试前必读，红线）
+### 真实性边界
 
-**这个项目是独立自评 pilot，不是腾讯工作内容。** 边界务必讲清，否则流利答完 DPO 反而会被当成"抢训练岗身份"：
+本项目不是九安医疗或腾讯的内部项目，DPO 训练也未在任何生产系统部署。仓库不包含公司代码、真实用户数据、内部提示词或内部指标。患者、工具、照护计划和执行结果均为合成数据。应用问题来自既往实践启发，实验设计、代码、数据与结论由个人独立完成。
 
-- **腾讯经历（真实、不含训练）**：在腾讯做的是 Agent **评测框架设计 + 线上 badcase 归因 + 银行侧部署支持**，全部在评测/上下文运行策略这一层，**不涉及模型训练**。这是本实验「Phase 1 上下文策略对照」和「badcase 归因」部分的概念来源——这部分我有真实生产经验。
-- **DPO 训练部分（明确是自学 pilot）**：本实验的「Phase 3 DPO」是**我自己为搞清"什么时候该提训需、什么时候改上下文就够"而跑的受控自学 pilot**（1.5B、单卡、小数据）。它能证明我懂训练链路（数据构造 / reward 信号 / 过拟合风险），但**不是生产级训练经验**——这一点在面试里要主动说清，不要含糊。
-- **一句话口径**：「我的生产经验在评测和上下文运行策略这一层；为把训练 vs 改上下文的干预边界搞清楚，我跑了一个 1.5B 上的受控 DPO pilot 作为自学。我能讲清整条链路，但清楚这是 pilot，不是生产训练。」
+## 受控环境
+
+环境模拟慢病照护运营平台中的信息读取、记录、提醒、教育内容投递、随访协调与人工升级。Agent 无权诊断、开药或自行修改处方；紧急情况与权限外决策必须升级人工。
+
+任务集中三类定向失效各 8 条，共 24 条：
+
+| 失效模式 | 典型风险 | train / test |
+|---|---|---:|
+| `tool_misuse` | 记录与更正混淆、普通消息代替紧急升级 | 5 / 3 |
+| `context_forgetting` | 遗忘过敏、授权、单位、时区或最新计划 | 5 / 3 |
+| `planning_drift` | 重复查询、遗漏闭环、越权采取高风险动作 | 5 / 3 |
+
+训练集和测试集按 `scenario_family` 隔离，不通过替换患者 ID 或数字构造同模板测试题。`context_forgetting` 的关键事实由早期工具观测暴露，不直接写进用户提示，以真实测试窗口截断和事件记忆的差异。
 
 ## 实验设计
 
-| 要素 | 设定 |
-|---|---|
-| 基座 | Qwen2.5-1.5B-Instruct（规模是常量，研究对象是策略） |
-| 任务集 | 自建 36–48 条办公/差旅/金融场景 tool-use 任务，定向诱发三类失效 |
-| 干预 A | 上下文组织策略 ×4：full（对照）/ window（截断）/ summary（压缩）/ **layered（分层结构化，event-memory 思路）** |
-| 干预 B | DPO（LoRA, beta=0.1）：偏好对 = 失败轨迹（rejected）vs 强模型修正轨迹（chosen，须过 checker） |
-| 失效分类 | tool_misuse / context_forgetting / planning_drift（badcase 归因标注） |
-| 指标 | ① 任务完成率（规则 checker）② LLM-as-a-judge 三维度 ③ **分类别净效果（核心）** ④ 上下文峰值（预算观察） |
-
+```text
+合成照护任务 + 确定性 mock 工具
+                |
+        Qwen2.5-1.5B ReAct 轨迹
+                |
+      +---------+----------+
+      |                    |
+上下文策略对照         训练集失败轨迹归因
+full/window/layered         |
+      |                合成 chosen + 双重校验
+      |                    |
+      |               LoRA-DPO
+      +---------+----------+
+                |
+       独立 test 集统一评测
 ```
-Phase 0  任务集与难度校准（完成率目标 30–50%）
-Phase 1  上下文策略对照：四策略 × 同一任务集 → 策略×失效模式 完成率矩阵
-Phase 2  归因 + 偏好对构造（chosen 须过 checker，宁缺毋滥）
-Phase 3  DPO 训练（盯 reward margin / accuracies，防 reward hacking）
-Phase 4  交叉分析：3×2 干预边界表 → 结论
+
+上下文策略：
+
+- `full`：保留完整消息历史。
+- `window`：只保留最近 2 轮工具交互。
+- `layered`：常驻目标、显式约束、已完成动作和结构化事件记忆，同时保留最近 2 轮原始交互。
+
+DPO 使用 Qwen2.5-1.5B-Instruct、LoRA rank 16、`beta=0.1`。偏好对仅来自 `train`；`chosen` 必须同时通过工具协议校验和任务 checker。`test` 在数据构造和训练期间保持不可见。
+
+训练前将 chosen/rejected 统一序列化为 Qwen 兼容的 `<tool_call>` 标记，避免用自定义 `CALL(...)` 文本训练、再用原生 Function Calling 评测造成协议错位。
+
+主指标是规则完成率，并按失效模式拆分。辅助指标包括平均步骤数、无效工具名占比、工具调用率和 API 返回的 prompt token 峰值。LLM-as-a-judge 仅用于人工难以覆盖的轨迹质量复核，不替代规则主指标。
+
+## 两晚执行路径
+
+安装依赖并启动启用了 Qwen 工具解析器的 OpenAI-compatible vLLM 服务：
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+  --model ./models/Qwen2.5-1.5B-Instruct --served-model-name base \
+  --port 8000 --max-model-len 8192 \
+  --enable-auto-tool-choice --tool-call-parser hermes
 ```
 
-## 核心结果（跑完填，只报分类别，不吹总体）
+然后执行：
 
-| | tool_misuse | context_forgetting | planning_drift |
-|---|---|---|---|
-| full 基线 | `__%` | `__%` | `__%` |
-| 最佳上下文策略（+幅度） | ? | ? | ? |
-| DPO（+幅度） | ? | ? | ? |
+```bash
+python3 scripts/0_validate_tasks.py
 
-关键发现（非显然的那几条，从实验里来）：
-1. `（例：分层使约束遗忘类 +X%，但窗口/摘要类策略对工具误选全部无效——上下文组织射程有限）`
-2. `（例：DPO 对工具误选 +X pp，对约束遗忘 −X pp 不显著——小数据偏好矫正的边界与副作用）`
-3. `（例：叠加效果 sub-additive，训练分布与部署分布的一致性问题）`
+for strategy in full window layered; do
+  python3 scripts/1_run_baseline.py \
+    --split test --strategy "$strategy" --repeats 3 --temperature 0.2 \
+    --base-url http://localhost:8000/v1 \
+    --out "data/test_${strategy}.jsonl" --resume
+done
 
-失败与迭代（v1 的坑与修复，如实写）：
-- `（例：v1 的 chosen 含直答捷径，DPO 后工具调用率暴跌，归因后 v2 在数据构造时强制轨迹完整性校验）`
+python3 scripts/5_evaluate.py \
+  --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl \
+  --out results/context_compare.md
+```
 
-## 手册与答案
+采集训练失败并构造偏好对：
 
-- **`EXPERIMENT_GUIDE.md`**：完整实验手册（操作步骤 + 15 道思考题）
-- **`ANSWERS.md`**：参考答案 + 实验设计深层意图 + 面试防守手册（做完再看）
+```bash
+python3 scripts/1_run_baseline.py \
+  --split train --strategy full --repeats 6 --temperature 0.7 \
+  --base-url http://localhost:8000/v1 \
+  --out data/train_full.jsonl --resume
 
-## 局限（诚实写在前头）
+python3 scripts/2_attribute.py \
+  --traj data/train_full.jsonl --out data/badcases_labeled.jsonl
 
-任务集自建（存在设计偏差）、单模型、偏好对规模小、chosen 为合成数据、结论是分类别相对结论而非绝对性能声明。
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=...
+python3 scripts/3_build_preference.py \
+  --badcase data/badcases_labeled.jsonl --out data/pref_pairs.jsonl \
+  --workers 4 --resume
+
+python3 scripts/4_to_llamafactory.py \
+  --pref data/pref_pairs.jsonl --outdir data/lf_data
+```
+
+将 `agent_pref.json` 和 `dataset_info.json` 复制到 `LLaMA-Factory/data/`，从仓库根目录运行：
+
+```bash
+llamafactory-cli train config/dpo_qwen15b.yaml
+llamafactory-cli export config/merge_lora.yaml
+```
+
+用合并模型在 `8001` 端口启动 vLLM，然后在同一测试集上评测：
+
+```bash
+python3 scripts/1_run_baseline.py \
+  --split test --strategy full --repeats 3 --temperature 0.2 \
+  --port 8001 --model dpo --out data/test_dpo.jsonl --resume
+
+python3 scripts/5_evaluate.py \
+  --before data/test_full.jsonl --after data/test_dpo.jsonl \
+  --out results/dpo_compare.md
+```
+
+完整操作与止损条件见 [`docs/EXPERIMENT_GUIDE.md`](docs/EXPERIMENT_GUIDE.md)，任务字段见 [`tasks/schema.md`](tasks/schema.md)。
+
+## 结果
+
+仓库当前完成了实验设计、受控环境和运行链路重构，结果尚未填写未经验证的结果。完成实跑后只报告独立测试集数字：
+
+| 干预 | tool_misuse | context_forgetting | planning_drift |
+|---|---:|---:|---:|
+| full 基线 | 待运行 | 待运行 | 待运行 |
+| window | 待运行 | 待运行 | 待运行 |
+| layered | 待运行 | 待运行 | 待运行 |
+| DPO（full 上下文） | 待运行 | 待运行 | 待运行 |
+
+## 局限
+
+- 24 条任务仍是小规模合成 pilot，结论只能解释当前受控环境。
+- 单基座、单次训练 seed，不支持生产级稳定性声明。
+- 测试集每类只有 3 个独立任务；重复采样增加的是轨迹数，不等同于增加独立任务数。
+- checker 能验证关键行为和安全边界，但不能覆盖自然语言质量的全部维度。
+- 强模型生成的 chosen 可能引入风格偏差，因此保留协议校验、规则校验和人工抽检三道质量控制。

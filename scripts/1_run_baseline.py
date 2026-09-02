@@ -1,30 +1,29 @@
-"""Step 1 — 跑基线：用 ReAct loop 采集完整轨迹，支持四种上下文组织策略（Phase 1 对照实验核心）。
+"""Step 1 — 用 ReAct loop 采集轨迹并对比上下文组织策略。
 
 用法：
-    # Phase 1：四种策略各跑一遍（对照实验）
-    python scripts/1_run_baseline.py --strategy full    --tasks tasks/tasks.jsonl --out data/p1_full.jsonl
-    python scripts/1_run_baseline.py --strategy window  --tasks tasks/tasks.jsonl --out data/p1_window.jsonl
-    python scripts/1_run_baseline.py --strategy summary --tasks tasks/tasks.jsonl --out data/p1_summary.jsonl
-    python scripts/1_run_baseline.py --strategy layered --tasks tasks/tasks.jsonl --out data/p1_layered.jsonl
+    python3 scripts/1_run_baseline.py --split test --strategy full --repeats 3 --out data/test_full.jsonl
+    python3 scripts/1_run_baseline.py --split test --strategy window --repeats 3 --out data/test_window.jsonl
+    python3 scripts/1_run_baseline.py --split test --strategy layered --repeats 3 --out data/test_layered.jsonl
 
     # 难度校准（先跑这个！）
     python scripts/1_run_baseline.py --strategy full --tasks tasks/tasks.jsonl --limit 10 --out data/probe.jsonl
 
-四种策略 = 同一模型，只变"上下文怎么组织"：
+主要策略 = 同一模型，只变"上下文怎么组织"：
 - full    全量历史（对照组，不做任何管理）
 - window  滑动窗口：只保留最近 K 轮工具交互（模拟最朴素的截断）
-- summary 摘要压缩：旧历史定期压成一段摘要（模拟多数"记忆"产品的做法）
 - layered 分层结构化：目标/约束/已完成步骤/关键观测做成常驻状态块 + 最近 2 轮细节
           （模拟 event-memory 思路：该常驻的常驻，该滚动的滚动）
 
-轨迹里记录每步实际发给模型的上下文长度（context_chars）——
-这是"上下文预算"的一手数据，别浪费。
+`summary` 作为可选探索策略保留，但不进入两晚主实验。
+
+轨迹同时记录 API usage 中的 prompt tokens 与字符数。
 """
 
 import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import (
@@ -33,12 +32,13 @@ from utils import (
 )
 
 SYSTEM = (
-    "你是一个严谨的办公助手，可以调用工具完成任务。\n"
+    "你是一个严谨的慢病照护运营助手，可以调用平台工具完成信息读取、记录、提醒和人工升级。\n"
     "要求：\n"
     "1. 每次只调用一个必要的工具，参数必须严格符合 schema；\n"
-    "2. 仔细阅读任务中给出的所有约束（预算、禁忌、格式、单位），任何一步都不能违反；\n"
-    "3. 达成目标后立即用自然语言给出最终答案，不要再调用多余工具；\n"
-    "4. 如果信息已足够就直接作答，不要重复调用同一个工具。"
+    "2. 保留任务和工具观测中的约束、授权、单位、时区与最新计划状态；\n"
+    "3. 不得诊断、开药或自行修改处方；遇到超出权限或紧急情况必须升级人工；\n"
+    "4. 达成目标后立即用自然语言给出最终答案，不要再调用多余工具；\n"
+    "5. 如果信息已足够就直接作答，不要重复调用同一个工具。"
 )
 
 SUMMARIZE_PROMPT = (
@@ -66,7 +66,7 @@ def _pair_up(messages):
     return pairs
 
 
-def apply_window(messages, keep_rounds=4):
+def apply_window(messages, keep_rounds=2):
     """滑动窗口：system+user 保留，中间只留最近 K 轮。模拟最朴素的截断做法。"""
     pairs = _pair_up(messages)
     kept = pairs[-keep_rounds:]
@@ -121,8 +121,8 @@ def build_state_block(task, steps_so_far):
         lines += [f"  {i+1}. {s['tool']}({json.dumps(s.get('args') or {}, ensure_ascii=False)})" for i, s in enumerate(done)]
     obs = [s.get("observation", "") for s in steps_so_far if s.get("observation")]
     if obs:
-        lines.append("关键观测（最近3条）:")
-        lines += [f"  - {o[:90]}" for o in obs[-3:]]
+        lines.append("事件记忆（按发生顺序保留）:")
+        lines += [f"  - {o[:180]}" for o in obs]
     lines.append("=== 继续执行任务 ===")
     return "\n".join(lines)
 
@@ -146,9 +146,11 @@ def build_user_message(task):
     return msg
 
 
-def run_one(client, model, task, strategy="full", verbose=False):
+def run_one(client, model, task, strategy="full", verbose=False,
+            temperature=0.2, seed=None, repeat=0):
     tools = build_tools_payload(task.get("tools") or [])
     valid_names = tool_names(task)
+    declared_args = {t["name"]: set((t.get("args") or {}).keys()) for t in (task.get("tools") or [])}
     max_steps = int(task.get("max_steps", 8))
 
     messages = [
@@ -157,7 +159,7 @@ def run_one(client, model, task, strategy="full", verbose=False):
     ]
 
     steps, tool_calls, final_answer = [], [], ""
-    context_chars = []
+    context_chars, prompt_tokens = [], []
 
     for i in range(max_steps):
         # ---- 上下文组织策略：每步调用模型前组装 ----
@@ -172,13 +174,18 @@ def run_one(client, model, task, strategy="full", verbose=False):
         else:
             raise ValueError(f"未知策略: {strategy}")
 
+        context_chars.append(sum(len(str(m.get("content") or "")) for m in eff))
         try:
             resp = client.chat.completions.create(
-                model=model, messages=eff, tools=tools, tool_choice="auto", temperature=0.2,
+                model=model, messages=eff, tools=tools, tool_choice="auto",
+                temperature=temperature, seed=seed,
             )
         except Exception as e:
             steps.append({"step": i + 1, "type": "error", "error": str(e)})
             break
+
+        usage = getattr(resp, "usage", None)
+        prompt_tokens.append(int(getattr(usage, "prompt_tokens", 0) or 0))
 
         msg = resp.choices[0].message
         calls = getattr(msg, "tool_calls", None) or []
@@ -203,16 +210,21 @@ def run_one(client, model, task, strategy="full", verbose=False):
             except Exception:
                 args = {"_raw": c.function.arguments}
             obs = mock_tool_call(name, args, task)
-            tool_calls.append({"name": name, "args": args, "valid_name": name in valid_names})
+            tool_calls.append({
+                "name": name,
+                "args": args,
+                "valid_name": name in valid_names,
+                "valid_args": name in declared_args and set(args) == declared_args[name],
+            })
             steps.append({
                 "step": i + 1, "type": "tool", "thought": msg.content or "",
                 "tool": name, "args": args, "observation": obs[:2000],
             })
             messages.append({"role": "tool", "tool_call_id": c.id, "content": obs})
 
-        context_chars.append(sum(len(str(m.get("content") or "")) for m in eff))
         if verbose:
-            print(f"  step{i+1}: {name}({args}) ctx={context_chars[-1]}")
+            names = ",".join(c.function.name for c in calls)
+            print(f"  step{i+1}: {names} ctx={context_chars[-1]} chars/{prompt_tokens[-1]} tokens")
 
     traj_core = {"tool_calls": tool_calls, "final_answer": final_answer}
     return {
@@ -222,12 +234,19 @@ def run_one(client, model, task, strategy="full", verbose=False):
         "goal": task.get("goal"),
         "constraints": task.get("constraints") or [],
         "model": model,
+        "split": task.get("split", "unspecified"),
+        "scenario_family": task.get("scenario_family"),
+        "repeat": repeat,
+        "seed": seed,
         "steps": steps,
         "tool_calls": tool_calls,
         "final_answer": final_answer,
         "n_steps": len(steps),
         "context_chars": context_chars,
         "max_context_chars": max(context_chars) if context_chars else 0,
+        "prompt_tokens": prompt_tokens,
+        "max_prompt_tokens": max(prompt_tokens) if prompt_tokens else 0,
+        "total_prompt_tokens": sum(prompt_tokens),
         "success": check_completion(task, traj_core),
     }
 
@@ -239,27 +258,58 @@ def main():
     ap.add_argument("--model", default="base")
     ap.add_argument("--strategy", default="full", choices=["full", "window", "summary", "layered"])
     ap.add_argument("--base-url", default=None)
+    ap.add_argument("--port", type=int, default=None, help="vLLM 端口；等价于 --base-url http://localhost:PORT/v1")
+    ap.add_argument("--split", default="all", choices=["all", "train", "test"])
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--resume", action="store_true", help="保留输出文件中已完成的 task/repeat")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     tasks = load_jsonl(args.tasks)
+    if args.split != "all":
+        tasks = [t for t in tasks if t.get("split") == args.split]
     if args.limit:
         tasks = tasks[: args.limit]
 
-    client = get_client(base_url=args.base_url)
-    rows = []
-    for t in tasks:
-        if args.verbose:
-            print(f"[{t.get('task_id')}] {t.get('goal')[:40]}...")
-        rows.append(run_one(client, args.model, t, strategy=args.strategy, verbose=args.verbose))
+    base_url = args.base_url or (f"http://localhost:{args.port}/v1" if args.port else None)
+    client = get_client(base_url=base_url)
+    rows = load_jsonl(args.out) if args.resume and os.path.exists(args.out) else []
+    done = {(r.get("task_id"), r.get("repeat", 0), r.get("strategy")) for r in rows}
+    jobs = []
+    for task_index, task in enumerate(tasks):
+        for repeat in range(args.repeats):
+            key = (task.get("task_id"), repeat, args.strategy)
+            if key not in done:
+                jobs.append((task_index, task, repeat, args.seed + task_index * 1000 + repeat))
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {
+            pool.submit(
+                run_one, client, args.model, task, args.strategy, args.verbose,
+                args.temperature, seed, repeat,
+            ): (task, repeat)
+            for _, task, repeat, seed in jobs
+        }
+        for future in as_completed(futures):
+            task, repeat = futures[future]
+            row = future.result()
+            rows.append(row)
+            rows.sort(key=lambda r: (r.get("task_id", ""), r.get("repeat", 0)))
+            save_jsonl(rows, args.out)
+            if args.verbose:
+                print(f"[{task.get('task_id')}#{repeat}] success={row['success']}")
 
     save_jsonl(rows, args.out)
 
     ok = sum(1 for r in rows if r["success"])
     avg_ctx = sum(r["max_context_chars"] for r in rows) / max(len(rows), 1)
+    avg_tokens = sum(r.get("max_prompt_tokens", 0) for r in rows) / max(len(rows), 1)
     print(f"\n[{args.strategy}] 完成 {len(rows)} 条：成功 {ok}（完成率 {ok / max(len(rows), 1):.0%}），"
-          f"平均上下文峰值 {avg_ctx:.0f} 字符")
+          f"平均上下文峰值 {avg_tokens:.0f} tokens / {avg_ctx:.0f} 字符")
     if args.limit:
         print("（难度校准模式）目标区间 30–50%。高于 70% 任务太简单，低于 20% 全是噪声——回去调 tasks.jsonl。")
     print(f"轨迹已写入：{args.out}")

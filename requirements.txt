@@ -13,4 +13,4 @@ tenacity>=8.3         # API 重试
 # 绘图（可选，画前后对比图）
 matplotlib>=3.8
 
-# 训练部分装在 LLaMA-Factory 里，见 QUICKSTART.md 第 11 步
+# 训练部分单独安装 LLaMA-Factory，见 README 与 docs/EXPERIMENT_GUIDE.md
