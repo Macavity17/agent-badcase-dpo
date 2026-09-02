@@ -405,7 +405,7 @@ OK
 ### 推送状态：`BLOCKED BY LOCAL NETWORK`
 
 - 第一次推送返回：`Could not resolve host: github.com`。
-- 后续推送未完成；本地 `main` 仍比 `origin/main` 领先 1 个提交。
+- 后续推送未完成；本地 `main` 比 `origin/main` 领先 3 个待推送提交：layered v2 代码修复、实验日志与记录协议，以及本条推送状态纠正。
 - 服务器仍在 `1f87b2a`，尚未获得 layered v2 修复。
 - 等用户切换本地网络后，再推送并让服务器 `git pull --ff-only origin main`。
 
