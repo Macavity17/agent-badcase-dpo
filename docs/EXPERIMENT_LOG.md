@@ -1124,3 +1124,27 @@ git diff --check
 实际结果：24 条任务校验通过；6 个单测全部通过；Python 编译通过；`git diff --check` 无输出。本轮未 commit、未 push，也没有重启 AutoDL GPU 服务。
 
 最后执行 `exit`，输出 `logout` 和 `Connection ... closed`，主动关闭空闲 SSH 会话。该操作不会关闭 AutoDL 实例；实例仍需在 AutoDL 控制台手动关机才停止计费。
+
+## 2026-09-03 / Run 14：本地提交与 GitHub 同步
+
+提交前重新执行任务校验、6 个单测、Python 编译和 `git diff --check`，全部通过。Git 作者邮箱确认为 `paxonw@163.com`。提交：
+
+```text
+a3eb5a5 feat: complete agent failure pilot
+10 files changed, 756 insertions(+), 145 deletions(-)
+```
+
+首次 `git push origin main` 没有更新远程跟踪分支；使用 `git push --verbose origin main` 重试后得到明确失败：
+
+```text
+Failed to connect to github.com port 443 after 75013 ms
+```
+
+本地 Git 和系统均无代理配置。`curl -I --connect-timeout 10 https://github.com` 随后返回 HTTP 200，说明是短时网络波动。再次执行 verbose push 成功：
+
+```text
+To https://github.com/Macavity17/agent-badcase-dpo.git
+   0454f39..a3eb5a5  main -> main
+```
+
+本次 GitHub 同步包含先前未推送的 2 个日志提交和本轮完整实验提交。`AGENTS.md`、`PROJECT_MEMORY.md`、本地凭据、AutoDL 原始 JSONL、模型和大型运行产物未进入 Git。
