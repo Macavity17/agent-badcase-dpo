@@ -1335,3 +1335,27 @@ holdout_v2.jsonl                        78d6cc68b8954c6bc9c3ded1daf6a71a129ee3da
 pair_review.jsonl                       862b459fe5874fd57cf4b09178f0ac0f2c8a34fe9614bf0233d2739f7143f827
 split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187a4568a349ed1109558680cc7
 ```
+
+### 提交与推送
+
+首次在受限本地文件系统中执行 `git add ... && git commit ...` 时，Git 无法创建 `.git/index.lock`，返回 `Operation not permitted`。这是 sandbox 对 `.git` 写入的限制，工作区文件没有损坏。在获得本地 Git 写入权限后重试，提交成功：
+
+```text
+613c9cc feat: harden round two preference pipeline
+17 files changed, 496 insertions(+), 123 deletions(-)
+```
+
+执行：
+
+```bash
+git push --verbose origin main
+```
+
+输出：
+
+```text
+To https://github.com/Macavity17/agent-badcase-dpo.git
+   428c092..613c9cc  main -> main
+```
+
+因此第二轮的数据审阅、协议对齐、固定切分、轮次隔离和收紧后 holdout 已上传 GitHub。这次 push 不包含被 Git 忽略的 `data/round2/` 派生 JSON；它们必须在服务器上按固定命令重建并进入证据包。
