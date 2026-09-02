@@ -53,7 +53,7 @@ full/window/layered         |
 
 - `full`：保留完整消息历史。
 - `window`：只保留最近 2 轮工具交互。
-- `layered`：常驻目标、显式约束、已完成动作和结构化事件记忆，同时保留最近 2 轮原始交互。
+- `layered`：常驻目标与显式约束，将较早动作和事件观测压缩为结构化状态，同时保留最近 1 轮原始交互。
 
 DPO 使用 Qwen2.5-1.5B-Instruct、LoRA rank 16、`beta=0.1`。偏好对仅来自 `train`；`chosen` 必须同时通过工具协议校验和任务 checker。`test` 在数据构造和训练期间保持不可见。
 
@@ -129,11 +129,11 @@ python3 scripts/5_evaluate.py \
   --out results/dpo_compare.md
 ```
 
-完整操作与止损条件见 [`docs/EXPERIMENT_GUIDE.md`](docs/EXPERIMENT_GUIDE.md)，任务字段见 [`tasks/schema.md`](tasks/schema.md)。
+完整操作与止损条件见 [`docs/EXPERIMENT_GUIDE.md`](docs/EXPERIMENT_GUIDE.md)，实际执行命令、输出、失败 run 和实验决策见 [`docs/EXPERIMENT_LOG.md`](docs/EXPERIMENT_LOG.md)，任务字段见 [`tasks/schema.md`](tasks/schema.md)。
 
 ## 结果
 
-仓库当前完成了实验设计、受控环境和运行链路重构，结果尚未填写未经验证的结果。完成实跑后只报告独立测试集数字：
+仓库当前完成了实验设计、受控环境和运行链路重构。首轮上下文对照已在实验日志中保留为地板效应与实现缺陷的诊断 run，不作为正向结论。完成修复后重跑和 DPO 评测后，只报告独立测试集的实际数字：
 
 | 干预 | tool_misuse | context_forgetting | planning_drift |
 |---|---:|---:|---:|

@@ -4,6 +4,12 @@
 
 实验截止日期为 2026-09-04。主线只做 Qwen2.5-1.5B-Instruct、`full/window/layered`、单 seed LoRA-DPO 和独立测试集评测。
 
+## 实验日志协议
+
+`docs/EXPERIMENT_LOG.md` 是实际执行记录。每完成一次实质性操作（环境变更、数据校验、采样、训练、评测、错误归因或实验决策）后立即追加：当时 commit、实际命令和参数、关键输出、产物路径、失败与下一步。保留失败 run，修复后使用新文件名，不覆盖旧结果。
+
+日志不得包含 SSH 密码、API key、Token 或其他凭据。
+
 ## 0. 开机与代码准备
 
 在 AutoDL 创建带 PyTorch/CUDA 的单卡实例，SSH 登录后执行：
