@@ -19,7 +19,7 @@ pref_loss: sigmoid      # sigmoid=DPO；也可试 hinge / ipo / kto_pair
 
 ### dataset
 dataset: agent_pref     # ← 对应 dataset_info.json 里的 key
-dataset_dir: ./LLaMA-Factory/data
+dataset_dir: ./data/lf_data
 template: qwen
 cutoff_len: 2048        # agent 轨迹较长，必要时调到 4096
 max_samples: 2000

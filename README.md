@@ -110,7 +110,7 @@ python3 scripts/4_to_llamafactory.py \
   --pref data/pref_pairs.jsonl --outdir data/lf_data
 ```
 
-将 `agent_pref.json` 和 `dataset_info.json` 复制到 `LLaMA-Factory/data/`，从仓库根目录运行：
+安装 LLaMA-Factory 后，从仓库根目录运行；训练配置会直接读取 `data/lf_data/`：
 
 ```bash
 llamafactory-cli train config/dpo_qwen15b.yaml
