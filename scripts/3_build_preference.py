@@ -19,6 +19,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -135,6 +136,185 @@ def render_steps_from_synth(steps):
     return "\n".join(render_tool_call(x.get("tool"), x.get("args") or {}) for x in steps)
 
 
+def walk_checks(check):
+    yield check
+    for child in check.get("checks") or []:
+        yield from walk_checks(child)
+
+
+def find_mock_values(value, key):
+    found = []
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            if child_key == key and isinstance(child_value, (str, int, float)):
+                found.append(str(child_value))
+            found.extend(find_mock_values(child_value, key))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(find_mock_values(child, key))
+    return found
+
+
+def canonical_arg(task, tool_name, arg_name, expected):
+    """从任务、checker 和确定性 mock 中构造可追溯的具体参数。"""
+    if arg_name in expected.get(tool_name, {}):
+        value = str(expected[tool_name][arg_name])
+        return value + "30" if arg_name == "send_at" and value.endswith(":") else value
+
+    goal = task.get("goal") or ""
+    mocks = task.get("mock_responses") or {}
+    dataflow_sources = {
+        ("draft_followup_message", "context"): ("get_last_followup", "summary"),
+        ("convert_measurements", "records"): ("get_measurement_history", None),
+        ("generate_summary", "records"): ("convert_measurements", None),
+        ("generate_plan_summary", "history"): ("get_execution_history", None),
+        ("generate_care_report", "measurements"): ("get_weekly_measurements", None),
+        ("generate_care_report", "adherence"): ("get_task_adherence", None),
+    }
+    source = dataflow_sources.get((tool_name, arg_name))
+    if source:
+        source_value = mocks.get(source[0])
+        if source[1] and isinstance(source_value, dict):
+            source_value = source_value.get(source[1])
+        if isinstance(source_value, str):
+            return source_value
+        return json.dumps(source_value, ensure_ascii=False, separators=(",", ":"))
+    if arg_name == "slot":
+        slots = find_mock_values(mocks, "slots")
+        if slots:
+            return slots[0]
+        for value in mocks.values():
+            if isinstance(value, dict) and value.get("slots"):
+                return str(value["slots"][0])
+    if arg_name == "record_ids":
+        ids = find_mock_values(mocks, "id")
+        if ids:
+            return ",".join(ids)
+    patterns = {
+        "patient_id": r"P\d{4}",
+        "measurement_id": r"BG-[A-Z0-9-]+",
+        "device_id": r"DEV-\d+",
+        "message_id": r"PM-\d+",
+        "questionnaire_id": r"Q-\d+",
+        "appointment_id": r"LAB-\d+",
+        "request_id": r"RR-\d+",
+    }
+    if arg_name in patterns:
+        match = re.search(patterns[arg_name], goal)
+        if match:
+            return match.group(0)
+
+    mock_values = find_mock_values(mocks, arg_name)
+    if mock_values:
+        return mock_values[-1]
+
+    time_match = re.search(r"\b\d{2}:\d{2}\b", goal)
+    quoted = re.findall(r"[“\"]([^”\"]+)[”\"]", goal)
+    defaults = {
+        "days": "7", "hours": "24", "within_minutes": "60",
+        "within_hours": "24", "week": "本周", "date": "明天",
+        "time": time_match.group(0) if time_match else "15:00",
+        "send_at": "19:30", "start_at": "2026-09-04 22:30",
+        "title": quoted[0] if quoted else "照护提醒",
+        "topic": quoted[0] if quoted else "慢病照护教育",
+        "status": "completed", "priority": "urgent" if "紧急" in goal else "high",
+        "language": "zh-CN", "format": "audio", "required_tag": "无坚果",
+        "screening_type": "年度眼底筛查", "department": "眼科",
+        "unit": "mmol/L", "target_unit": "mmol/L", "value": "16.2",
+        "new_value": "6.8", "reason": "按平台流程处理",
+        "message": "已按照护流程发送通知",
+        "content": "已按授权范围发送合规通知",
+        "context": "根据最近随访摘要继续执行",
+        "records": "工具返回的已换算记录",
+        "history": "工具返回的执行记录",
+        "measurements": "工具返回的周度指标",
+        "adherence": "工具返回的任务执行情况",
+        "outcome": "已提醒并安排随访", "instruction": "按检验要求禁食",
+        "caregiver": "家属", "slot": "工具返回的首个可用时段",
+        "record_ids": "工具返回的冲突记录ID",
+        "plan_version": "CP-v3", "version": "current",
+    }
+    if arg_name.endswith("_id"):
+        for source_key in (
+            arg_name, "resource_id", "reminder_id", "referral_id", "report_id",
+            "case_id", "request_id", "appointment_id",
+        ):
+            values = find_mock_values(mocks, source_key)
+            if values:
+                return values[-1]
+    return defaults.get(arg_name, f"具体{arg_name}")
+
+
+def canonical_chosen(task):
+    """用任务作者的 gold workflow 构造 chosen，不调用外部模型。"""
+    checks = list(walk_checks(task.get("checker") or {}))
+    sequences = [c.get("tools") or [] for c in checks if c.get("type") == "tool_call_sequence"]
+    if sequences:
+        sequence = max(sequences, key=len)
+    else:
+        sequence = list(dict.fromkeys(
+            check.get("expect_tool")
+            for check in checks
+            if check.get("type") == "tool_call" and check.get("expect_tool")
+        ))
+    if not sequence:
+        return None, "checker 没有 gold 工具调用"
+    expected = {}
+    for check in checks:
+        if check.get("type") == "tool_call":
+            expected.setdefault(check.get("expect_tool"), {}).update(
+                check.get("expect_args_contains") or {}
+            )
+
+    tool_specs = {tool["name"]: tool for tool in task.get("tools") or []}
+    steps = []
+    for name in sequence:
+        spec = tool_specs[name]
+        args = {
+            arg_name: canonical_arg(task, name, arg_name, expected)
+            for arg_name in (spec.get("args") or {})
+        }
+        steps.append({"tool": name, "args": args})
+
+    required_final = []
+    for check in checks:
+        if check.get("type") == "final_contains_all":
+            required_final.extend(check.get("values") or [])
+        elif check.get("type") in {"final_contains", "final_contains_any"}:
+            values = check.get("values") or []
+            if values:
+                required_final.append(values[0])
+    for name in sequence:
+        mock = (task.get("mock_responses") or {}).get(name)
+        for key in ("log_id", "summary_id", "message_id", "report_id", "archive_id",
+                    "notification_id", "referral_id", "followup_id", "review_id",
+                    "case_id", "event_id", "delivery_id", "reminder_id", "request_id"):
+            required_final.extend(find_mock_values(mock, key))
+    details = list(dict.fromkeys(str(value) for value in required_final))
+    final = "已按要求完成全部操作。"
+    if details:
+        final += "关键结果：" + "、".join(details) + "。"
+
+    protocol_ok, protocol_info = validate_synth_steps(task, steps)
+    pseudo = {
+        "tool_calls": [{"name": step["tool"], "args": step["args"]} for step in steps],
+        "final_answer": final,
+    }
+    if not protocol_ok:
+        return None, protocol_info
+    if not check_completion(task, pseudo):
+        return None, "canonical chosen 未通过 checker"
+    return {
+        "text": (
+            render_steps_from_synth(steps)
+            + "\n" + render_tool_call("finish_task", {})
+            + f"\n{final}"
+        ),
+        "steps": steps,
+        "final_answer": final,
+    }, (True, "canonical checker 通过")
+
+
 def render_rejected(traj):
     """保留能呈现主失败原因的完整轨迹，供 response-level DPO 比较。"""
     return render_steps(traj.get("steps"))
@@ -146,6 +326,7 @@ def main():
     ap.add_argument("--tasks", default="tasks/tasks.jsonl")
     ap.add_argument("--out", default="data/pref_pairs.jsonl")
     ap.add_argument("--model", default=os.environ.get("SYNTH_MODEL", "deepseek-chat"))
+    ap.add_argument("--synth-mode", choices=["model", "canonical"], default="model")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--resume", action="store_true")
@@ -156,7 +337,7 @@ def main():
     if args.limit:
         bad = bad[: args.limit]
 
-    client = get_client()
+    client = get_client() if args.synth_mode == "model" else None
     pairs = load_jsonl(args.out) if args.resume and os.path.exists(args.out) else []
     done = {(p.get("task_id"), p.get("source_repeat", 0)) for p in pairs}
     pending = [b for b in bad if (b.get("task_id"), b.get("repeat", 0)) not in done]
@@ -166,7 +347,10 @@ def main():
         task = tasks.get(b.get("task_id"))
         if task is None:
             return b, None, "任务定义不存在"
-        chosen, info = synth_chosen(client, args.model, task, b)
+        if args.synth_mode == "canonical":
+            chosen, info = canonical_chosen(task)
+        else:
+            chosen, info = synth_chosen(client, args.model, task, b)
         if chosen is None or (isinstance(info, tuple) and not info[0]):
             return b, None, info
         return b, {

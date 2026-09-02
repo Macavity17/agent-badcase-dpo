@@ -6,8 +6,8 @@
 
     # 上下文策略对比（本实验的核心表）
     python scripts/5_evaluate.py \
-        --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl \
-        --out results/context_compare.md
+        --files full=data/holdout_base_full.jsonl,window=data/holdout_base_window.jsonl,layered=data/holdout_base_layered.jsonl \
+        --out results/holdout_context_compare.md
 
     # Phase 3：DPO 前后对比（含 judge，需配 OPENAI_API_KEY / OPENAI_BASE_URL）
     python scripts/5_evaluate.py --before data/p1_full.jsonl --after data/dpo_trajectories.jsonl --out results/phase3_compare.md
@@ -147,6 +147,10 @@ def md_table(headers, rows):
     return "\n".join(out)
 
 
+def pp_delta(value):
+    return f"{value * 100:+.1f}pp"
+
+
 def build_multi_report(groups, ordered_labels):
     lines = ["# Phase 1：上下文策略 × 失效模式 对照结果", ""]
     lines.append(f"基线（full）覆盖 {groups[ordered_labels[0]]['tasks']} 个任务、"
@@ -181,13 +185,25 @@ def build_multi_report(groups, ordered_labels):
         rows.append([lb, f"{st['avg_ctx']:.0f}", f"{st['rate']:.1%}"])
     lines.append(md_table(["策略", "平均 prompt 峰值(tokens)", "完成率"], rows))
     lines.append("")
-    lines.append("看什么：layered 是否做到了「上下文峰值接近 window，但完成率显著更高」？"
-                 "如果是，这就是「分层组织优于朴素压缩」的直接证据（JD 原文论断的复现）。")
-    lines.append("")
-
     lines.append("## 4. 结论与局限")
-    lines.append("- **结论**：（跑完再写。建议格式：对每一类失效，指明最优策略及差距幅度）")
-    lines.append("- **局限**：任务集自建（设计偏差）、单模型、judge 为主观副指标")
+    baseline_label = "full" if "full" in groups else ordered_labels[0]
+    baseline = groups[baseline_label]
+    comparisons = []
+    for label in ordered_labels:
+        if label == baseline_label:
+            continue
+        current = groups[label]
+        token_delta = (
+            (current["avg_ctx"] - baseline["avg_ctx"]) / baseline["avg_ctx"]
+            if baseline["avg_ctx"] else 0
+        )
+        comparisons.append(
+            f"{label} 相对 {baseline_label} 完成率 {pp_delta(current['rate'] - baseline['rate'])}，"
+            f"平均 prompt 峰值 {token_delta:+.1%}"
+        )
+    lines.append("- **结论**：" + "；".join(comparisons) + "。")
+    lines.append("- **解释边界**：只有完成率提高且预算/安全指标没有明显退化时，才支持正向策略收益；否则按负结果或权衡报告。")
+    lines.append("- **局限**：任务集自建、单模型，重复轨迹不等同于新增独立任务。")
     return "\n".join(lines)
 
 
@@ -234,8 +250,21 @@ def build_before_after(before, after, b_judge=None, a_judge=None):
         lines.append(md_table(["维度", "Before", "After", "变化"], rows))
         lines.append("")
     lines.append("## 4. 结论与局限")
-    lines.append("- **结论**：（跑完再写。核心问题：DPO 修好了哪类、没修好哪类、有没有恶化哪类）")
-    lines.append("- **局限**：偏好对规模小、单 seed（入职周补多 seed）、chosen 为合成数据")
+    delta = after["rate"] - before["rate"]
+    direction = "提升" if delta > 0 else "下降" if delta < 0 else "持平"
+    mode_changes = []
+    for mode in MODES:
+        br, _ = before["by_mode"].get(mode, (None, 0))
+        ar, _ = after["by_mode"].get(mode, (None, 0))
+        if br is not None and ar is not None:
+            mode_changes.append(f"{mode} {pp_delta(ar - br)}")
+    lines.append(
+        f"- **结论**：总体完成率{direction} {abs(delta) * 100:.1f}pp；"
+        + "，".join(mode_changes) + "。"
+    )
+    if after["invalid_call_rate"] <= before["invalid_call_rate"] and delta <= 0:
+        lines.append("- **诊断**：协议错误没有增加但完成率未改善，说明格式正确不能替代参数语义、工作流闭环和结果回传评测。")
+    lines.append("- **局限**：偏好对规模小、单 seed；必须如实说明 chosen 的具体来源与校验方式。")
     return "\n".join(lines)
 
 

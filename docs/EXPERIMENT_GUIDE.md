@@ -6,7 +6,7 @@
 
 ## 实验日志协议
 
-`docs/EXPERIMENT_LOG.md` 是实际执行记录。每完成一次实质性操作（环境变更、数据校验、采样、训练、评测、错误归因或实验决策）后立即追加：当时 commit、实际命令和参数、关键输出、产物路径、失败与下一步。服务器上的每一条 shell 命令都要进入文末的命令账本，包括诊断、等待、日志查看、失败命令和重试。保留失败 run，修复后使用新文件名，不覆盖旧结果。
+`docs/EXPERIMENT_LOG.md` 是实际执行记录。每轮需求结束前统一追加：当时 commit、实际命令和参数、关键输出、产物路径、失败与下一步。服务器上的每一条 shell 命令都要进入命令账本，包括诊断、等待、日志查看、失败命令和重试。保留失败 run，修复后使用新文件名，不覆盖旧结果。
 
 日志不得包含 SSH 密码、API key、Token 或其他凭据。
 
@@ -122,10 +122,10 @@ for strategy in full window layered; do
     --strategy "$strategy" \
     --repeats 3 \
     --temperature 0.2 \
-    --seed 42 \
+    --seed 20260902 \
     --workers 4 \
     --base-url http://localhost:8000/v1 \
-    --out "data/test_${strategy}.jsonl" \
+    --out "data/holdout_base_${strategy}.jsonl" \
     --resume
 done
 ```
@@ -134,12 +134,12 @@ done
 
 ```bash
 python3 scripts/5_evaluate.py \
-  --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl \
-  --out results/context_compare.md
+  --files full=data/holdout_base_full.jsonl,window=data/holdout_base_window.jsonl,layered=data/holdout_base_layered.jsonl \
+  --out results/holdout_context_compare.md
 
-sed -n '1,220p' results/context_compare.md
-wc -l data/test_full.jsonl data/test_window.jsonl data/test_layered.jsonl
-grep -n '"type": "error"' data/test_*.jsonl || true
+sed -n '1,220p' results/holdout_context_compare.md
+wc -l data/holdout_base_full.jsonl data/holdout_base_window.jsonl data/holdout_base_layered.jsonl
+grep -n '"type": "error"' data/holdout_base_*.jsonl || true
 ```
 
 每组应有 27 条轨迹。服务错误不能算模型失败。如果三组均高于 80% 或低于 10%，先检查任务难度与 checker，不解释策略差异。
@@ -154,66 +154,62 @@ python3 scripts/1_run_baseline.py \
   --strategy full \
   --repeats 6 \
   --temperature 0.7 \
-  --seed 2026 \
+  --seed 4242 \
   --workers 4 \
   --base-url http://localhost:8000/v1 \
-  --out data/train_full.jsonl \
+  --out data/train_base_full_r6.jsonl \
   --resume
 
-wc -l data/train_full.jsonl
-grep -n '"type": "error"' data/train_full.jsonl || true
+wc -l data/train_base_full_r6.jsonl
+grep -n '"type": "error"' data/train_base_full_r6.jsonl || true
 ```
 
 应有 90 条候选轨迹。然后归因真实失败，默认排除 API/服务错误：
 
 ```bash
 python3 scripts/2_attribute.py \
-  --traj data/train_full.jsonl \
+  --traj data/train_base_full_r6.jsonl \
   --tasks tasks/tasks.jsonl \
-  --out data/badcases_labeled.jsonl
+  --out data/train_badcases_labeled.jsonl
 
-wc -l data/badcases_labeled.jsonl
+wc -l data/train_badcases_labeled.jsonl
 ```
 
-## 6. 用强模型合成 chosen
+## 6. 构造并校验 canonical chosen
 
-以下以 OpenAI-compatible API 为例。将占位符替换为实际服务信息，不要把真实 key 写入 Markdown 或 Git：
+当前快速试验使用任务 gold workflow、checker 和确定性 mock 构造 canonical chosen，不需要外部 API。这些数据必须描述为“规则约束 canonical 合成轨迹”，不得写成强模型或人工标注：
 
 ```bash
-export OPENAI_API_KEY='<YOUR_API_KEY>'
-export OPENAI_BASE_URL='<YOUR_OPENAI_COMPATIBLE_BASE_URL>'
-export SYNTH_MODEL='<YOUR_SYNTH_MODEL_NAME>'
-
 python3 scripts/3_build_preference.py \
-  --badcase data/badcases_labeled.jsonl \
+  --synth-mode canonical \
+  --badcase data/train_badcases_labeled.jsonl \
   --tasks tasks/tasks.jsonl \
-  --out data/pref_pairs.jsonl \
-  --model "$SYNTH_MODEL" \
-  --workers 4 \
-  --resume
+  --out data/pref_pairs_canonical_v2.jsonl \
+  --workers 4
 
-wc -l data/pref_pairs.jsonl
-sed -n '1,5p' data/pref_pairs.jsonl
+wc -l data/pref_pairs_canonical_v2.jsonl
+sed -n '1,5p' data/pref_pairs_canonical_v2.jsonl
 ```
 
-人工检查前 5 对：chosen 是否完成必要读取、是否使用真实 schema、是否越权诊断/开药、rejected 是否确实更差。目标是 40–70 条有效偏好对。
+人工检查至少 5 对：chosen 是否完成必要读取、参数是否来自任务或 mock 观测、是否包含 `finish_task`、是否越权诊断/开药、rejected 是否确实更差。目标是 40–70 条有效偏好对。
 
 如果少于 40 条，只增加 train 的重复采样：
 
 ```bash
 python3 scripts/1_run_baseline.py \
   --split train --strategy full --repeats 8 --temperature 0.7 \
-  --seed 2026 --workers 4 \
+  --seed 4242 --workers 4 \
   --base-url http://localhost:8000/v1 \
-  --out data/train_full.jsonl --resume
+  --out data/train_base_full_r8.jsonl --resume
 
 python3 scripts/2_attribute.py \
-  --traj data/train_full.jsonl --out data/badcases_labeled.jsonl
+  --traj data/train_base_full_r8.jsonl --out data/train_badcases_labeled_r8.jsonl
 
 python3 scripts/3_build_preference.py \
-  --badcase data/badcases_labeled.jsonl \
-  --out data/pref_pairs.jsonl \
-  --model "$SYNTH_MODEL" --workers 4 --resume
+  --synth-mode canonical \
+  --badcase data/train_badcases_labeled_r8.jsonl \
+  --tasks tasks/tasks.jsonl \
+  --out data/pref_pairs_canonical_r8.jsonl --workers 4
 ```
 
 不要降低 checker 标准，也不要使用 test 轨迹补量。
@@ -222,7 +218,7 @@ python3 scripts/3_build_preference.py \
 
 ```bash
 python3 scripts/4_to_llamafactory.py \
-  --pref data/pref_pairs.jsonl \
+  --pref data/pref_pairs_canonical_v2.jsonl \
   --outdir data/lf_data
 
 python3 -m json.tool data/lf_data/agent_pref.json > /dev/null
@@ -242,7 +238,7 @@ sleep 5
 nvidia-smi
 ```
 
-创建独立训练环境并安装 LLaMA-Factory：
+训练环境放在数据盘。从已验证 CUDA 可用的 `care-infer` 克隆，避免再下载数百 MB 的 PyTorch 轮子，然后只安装 LLaMA-Factory 训练依赖：
 
 ```bash
 conda deactivate
@@ -250,22 +246,29 @@ cd /root/autodl-tmp/agent-badcase-dpo
 
 git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git vendor/LLaMA-Factory
 
-conda create -n care-train python=3.11 -y
-conda activate care-train
-python -m pip install --upgrade pip
-python -m pip install -e "./vendor/LLaMA-Factory[torch,metrics]"
+conda create --prefix /root/autodl-tmp/envs/care-train \
+  --clone /root/miniconda3/envs/care-infer -y
+conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  python -m pip install -e './vendor/LLaMA-Factory[metrics]'
 
-git -C vendor/LLaMA-Factory rev-parse HEAD > runs/llamafactory_commit.txt
-llamafactory-cli --help
+git -C vendor/LLaMA-Factory rev-parse HEAD
+conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  llamafactory-cli version
 ```
 
 如果 `vendor/LLaMA-Factory` 已存在：
 
 ```bash
 git -C vendor/LLaMA-Factory pull --ff-only
-python -m pip install -e "./vendor/LLaMA-Factory[torch,metrics]"
-git -C vendor/LLaMA-Factory rev-parse HEAD > runs/llamafactory_commit.txt
+conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  python -m pip install -e './vendor/LLaMA-Factory[metrics]'
+git -C vendor/LLaMA-Factory rev-parse HEAD
 ```
+
+LLaMA-Factory 可能将克隆环境中的 `starlette` 降级，与 vLLM 依赖冲突。这是可接受的，因为数据盘环境只训练，推理仍使用 `/root/miniconda3/envs/care-infer`；不要在 `care-train` 里启动 vLLM。
 
 ## 9. 运行 LoRA-DPO
 
@@ -273,10 +276,9 @@ git -C vendor/LLaMA-Factory rev-parse HEAD > runs/llamafactory_commit.txt
 
 ```bash
 cd /root/autodl-tmp/agent-badcase-dpo
-eval "$(conda shell.bash hook)"
-conda activate care-train
-
-nohup llamafactory-cli train config/dpo_qwen15b.yaml \
+nohup conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  llamafactory-cli train config/dpo_qwen15b.yaml \
   > runs/dpo_train.log 2>&1 &
 
 echo $! > runs/dpo_train.pid
@@ -298,10 +300,9 @@ nvidia-smi
 
 ```bash
 cd /root/autodl-tmp/agent-badcase-dpo
-eval "$(conda shell.bash hook)"
-conda activate care-train
-
-llamafactory-cli export config/merge_lora.yaml \
+conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-train \
+  llamafactory-cli export config/merge_lora.yaml \
   > runs/merge_lora.log 2>&1
 
 find outputs/dpo_merged -maxdepth 1 -type f | sort
@@ -309,13 +310,11 @@ find outputs/dpo_merged -maxdepth 1 -type f | sort
 
 ## 11. 启动 DPO 模型
 
-退出训练环境并回到推理环境：
+使用推理环境的绝对 Python 路径启动，避免 SSH shell 当前环境不明：
 
 ```bash
-conda deactivate
-conda activate care-infer
-
-nohup python3 -m vllm.entrypoints.openai.api_server \
+nohup /root/miniconda3/envs/care-infer/bin/python \
+  -m vllm.entrypoints.openai.api_server \
   --model ./outputs/dpo_merged \
   --served-model-name dpo \
   --port 8001 \
@@ -340,27 +339,27 @@ curl -s http://localhost:8001/v1/models
 DPO 只在 untouched test split 上以与 base/full 相同的条件评测：
 
 ```bash
-python3 scripts/1_run_baseline.py \
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
   --split test \
   --strategy full \
   --repeats 3 \
   --temperature 0.2 \
-  --seed 42 \
+  --seed 20260902 \
   --workers 4 \
   --port 8001 \
   --model dpo \
-  --out data/test_dpo.jsonl \
+  --out data/holdout_dpo_full_seed20260902.jsonl \
   --resume
 
-grep -n '"type": "error"' data/test_dpo.jsonl || true
-wc -l data/test_dpo.jsonl
+grep -n '"type": "error"' data/holdout_dpo_full_seed20260902.jsonl || true
+wc -l data/holdout_dpo_full_seed20260902.jsonl
 
-python3 scripts/5_evaluate.py \
-  --before data/test_full.jsonl \
-  --after data/test_dpo.jsonl \
-  --out results/dpo_compare.md
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py \
+  --before data/holdout_base_full.jsonl \
+  --after data/holdout_dpo_full_seed20260902.jsonl \
+  --out results/dpo_compare_seed20260902.md
 
-sed -n '1,240p' results/dpo_compare.md
+sed -n '1,240p' results/dpo_compare_seed20260902.md
 ```
 
 必须同时检查完成率、工具调用率、工具协议错误、平均步骤和重复行为。至少人工对比 3 个相同 task/repeat 的 base 与 DPO 轨迹。只有目标指标改善且没有明显退化，才能写“提升”。
@@ -372,7 +371,7 @@ sed -n '1,240p' results/dpo_compare.md
 ```bash
 cd /root/autodl-tmp/agent-badcase-dpo
 tar -czf /root/autodl-tmp/care-agent-evidence-20260903.tar.gz \
-  data results runs config tasks README.md
+  data results runs config tasks docs README.md
 
 ls -lh /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
 ```

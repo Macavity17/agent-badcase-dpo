@@ -1,6 +1,6 @@
 # 实验日志
 
-Last updated: 2026-09-02 (Asia/Shanghai)
+Last updated: 2026-09-03 (Asia/Shanghai)
 
 本文档记录实际执行的实验，与 `docs/EXPERIMENT_GUIDE.md` 的预期操作分开。未执行的命令、未观测的结果不得写成完成项。失败的 run 保留原始结果，修复后使用新的记录和输出文件。
 
@@ -843,3 +843,284 @@ Connection closed.
 ```
 
 该命令只关闭交互式 SSH。AutoDL 实例仍运行和计费，使用 `nohup ... &` 启动的 vLLM 不随该会话退出。
+
+## 2026-09-02 / Run 9：协议修复、train-only 校准与冻结 holdout
+
+### 修复决策
+
+前两轮数据显示的主要问题是“模型在工具观测后直接输出文本，没有继续工具循环”，且多个任务的 ID 不充分。本轮实施：
+
+- 加入共享 `finish_task` 控制工具；完成前 `tool_choice=required`，完成后 `tool_choice=none` 产生最终答复。
+- 强制串行工具调用，`parallel_tool_calls=False`。
+- `finish_task` 不计入业务工具数。
+- layered 保留最近两轮原始 assistant/tool，早期历史压缩为状态。
+- 为欠规定任务补充具体事件 ID 和可追溯 mock 值。
+
+先前已人工查看的 9 个 test 任务移入 `tasks/dev_tasks.jsonl`。新建 9 个患者/事件 ID 不重复的 test 任务作为最终 holdout；此后没有根据 holdout 表现修改任务或 checker。
+
+### 验证与校准结果
+
+关键命令（代码变更通过 `git apply - <<'PATCH' ... PATCH` 完成）：
+
+```bash
+python3 scripts/0_validate_tasks.py
+python3 -m unittest discover -s tests -v
+python3 -m py_compile scripts/*.py
+git diff --check
+```
+
+结果：24 条任务、15 train / 9 test、三类失效各 8 条；dev/holdout 患者 ID 无交集；5 个单测全部通过。
+
+train-only 小样本校准每任务跑 1 次，失败 run 使用不同文件名保留。最终同一版任务的 v3 结果：
+
+| 策略 | 成功 | 平均 prompt 峰值 |
+|---|---:|---:|
+| full | 4/15 (26.7%) | 1,201 |
+| window | 4/15 (26.7%) | 1,048 |
+| layered | 5/15 (33.3%) | 1,182 |
+
+冻结 holdout 随后每策略跑 9 任务 x 3 次，无服务错误：
+
+| 策略 | 成功 | 平均 prompt 峰值 |
+|---|---:|---:|
+| full | 4/27 (14.8%) | 1,234 |
+| window | 0/27 (0.0%) | 1,068 |
+| layered | 3/27 (11.1%) | 1,205 |
+
+分类为：full `0/9, 1/9, 3/9`，window `0/9, 0/9, 0/9`，layered `1/9, 2/9, 0/9`（顺序均为 tool misuse / context forgetting / planning drift）。window 节省约 13.5% 峰值 token 但完成率归零；layered 只节省约 2.4% 且不超过 full。结论标记为 `VALID NEGATIVE RESULT`：不支持正向上下文收益，但显示了截断与状态压缩的干预边界。
+
+一次评测命令错把多文件参数写成 `--inputs`，脚本拒绝该参数；正确参数为 `--files`。错误未影响 JSONL 轨迹。
+
+## 2026-09-02 / Run 10：train-only 归因、canonical 偏好数据与导出
+
+### 训练轨迹与归因
+
+`full` 在 15 个 train 任务上每任务采样 6 次，得到 90 条轨迹：22 成功、68 失败、0 服务错误。
+
+```bash
+python3 scripts/2_attribute.py --traj data/train_base_full_r6.jsonl --tasks tasks/tasks.jsonl --out data/train_badcases_labeled.jsonl
+```
+
+归因分布：
+
+```text
+planning_drift:     32
+context_forgetting: 23
+tool_misuse:        13
+```
+
+### canonical chosen 构造
+
+首个 `data/pref_pairs_canonical.jsonl` 虽通过基础校验，但人工查看发现部分参数存在“工具返回的...”式占位文本，因此拒绝作为训练数据并保留文件。修复参数从 goal/checker/mock 取值、显式加入 `finish_task` 后，生成 v2：
+
+```bash
+python3 scripts/3_build_preference.py --synth-mode canonical --badcase data/train_badcases_labeled.jsonl --tasks tasks/tasks.jsonl --out data/pref_pairs_canonical.jsonl --workers 4
+python3 scripts/3_build_preference.py --synth-mode canonical --badcase data/train_badcases_labeled.jsonl --tasks tasks/tasks.jsonl --out data/pref_pairs_canonical_v2.jsonl --workers 4
+python3 scripts/4_to_llamafactory.py --pref data/pref_pairs_canonical_v2.jsonl --outdir data/lf_data
+cat data/lf_data/stat.json
+```
+
+v2 输出 68 对，0 丢弃，0 chosen/rejected 相同。68/68 chosen 包含 `finish_task`，且每条同时通过协议和任务 checker。LLaMA-Factory 导出为 `data/lf_data/agent_pref.json`、`dataset_info.json`和 `stat.json`。正确定性描述是“规则约束 canonical 合成 chosen”，不是强模型或人工标注。
+
+## 2026-09-02 / Run 11：LLaMA-Factory 环境修复与 LoRA-DPO
+
+### 第一次安装：`FAILED / INTERRUPTED`
+
+初始使用系统盘 named env 和 `[torch,metrics]` extra，pip 开始以约 270 KB/s 下载 526.6 MB Torch wheel。这不符合两晚时间约束，也解释了 AutoDL 数据盘曲线基本不动：当时写入的是 `/root/miniconda3/envs` 和 `/root/.cache/pip`，而非 `/root/autodl-tmp`。下载被中断，88 MB 失败环境后续删除。
+
+相关命令：
+
+```bash
+git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git vendor/LLaMA-Factory
+conda create -n care-train python=3.11 -y
+conda run -n care-train python -m pip install --upgrade pip
+conda run -n care-train python -m pip install -e './vendor/LLaMA-Factory[torch,metrics]'
+pgrep -af 'pip install|conda run|LLaMA-Factory'
+ps -eo pid,ppid,stat,etime,%cpu,%mem,cmd --sort=-%cpu | head -25
+du -sh /root/miniconda3/envs/care-train /root/.cache/pip 2>/dev/null
+df -h / /root/autodl-tmp
+ss -tpn | grep -E 'python|pip|conda' || true
+conda remove -n care-train --all -y
+```
+
+### 数据盘环境：`SUCCESS`
+
+将已验证 CUDA 可用的 `care-infer` 克隆到数据盘，再只安装 `[metrics]`：
+
+```bash
+conda create --prefix /root/autodl-tmp/envs/care-train --clone /root/miniconda3/envs/care-infer -y
+du -sh /root/autodl-tmp/envs/care-train
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+grep -n -A25 '^\[project.optional-dependencies\]' vendor/LLaMA-Factory/pyproject.toml
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train python -m pip install -e './vendor/LLaMA-Factory[metrics]'
+du -sh /root/autodl-tmp/envs/care-train
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli --help
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli version
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train python -c 'import torch, transformers, accelerate, peft, trl; print("torch", torch.__version__); print("cuda", torch.cuda.is_available(), torch.version.cuda); print("transformers", transformers.__version__); print("accelerate", accelerate.__version__); print("peft", peft.__version__); print("trl", trl.__version__)'
+git -C vendor/LLaMA-Factory rev-parse HEAD
+```
+
+克隆后 8.2 GB，安装后 9.1 GB，路径均为 `/root/autodl-tmp/envs/care-train`。版本：Torch `2.13.0+cu130`、CUDA available `True`、Transformers `5.8.0`、Accelerate `1.11.0`、PEFT `0.18.1`、TRL `0.24.0`、LLaMA-Factory `0.9.6.dev0`，Git commit `4451765a6b04ff08a6c5650f5953513608ae9e64`。`llamafactory-cli --help` 输出 `Unknown command: --help` 但同时显示了完整用法；正确版本命令是 `llamafactory-cli version`。
+
+pip 将 `starlette` 降为 0.52.1，与克隆进来的 vLLM 0.28.0 需求冲突。该环境被限定为训练用，推理仍由原 `care-infer` 承担，因此不混用两种角色。
+
+### 训练与 merge
+
+```bash
+ls -la runs
+cat runs/vllm_base.pid
+ps -fp 2617
+kill 2617
+ps -fp 2617
+nvidia-smi
+nohup conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli train config/dpo_qwen15b.yaml > runs/dpo_train.log 2>&1 &
+tail -80 runs/dpo_train.log
+ps -fp 7831
+tail -120 runs/dpo_train.log
+tail -80 runs/dpo_train.log
+tail -120 runs/dpo_train.log
+conda run --no-capture-output -p /root/autodl-tmp/envs/care-train llamafactory-cli export config/merge_lora.yaml
+```
+
+基座 vLLM 停止后显存为 0 MiB。训练使用 61 train / 7 eval、3 epoch、24 optimization steps、18,464,768 可训参数（1.1820%）。总训练时间 44.46 秒，train loss 0.6239。最佳 checkpoint 为 step 20，最终 eval loss 0.5857、reward accuracy 1.0、chosen reward 0.1611、rejected reward -0.0558、margin 0.217。merge 成功输出 `outputs/dpo_merged/model.safetensors`。
+
+## 2026-09-03 / Run 12：冻结 holdout DPO 评测、负结果归因与备份
+
+### 服务启动中的两个失败
+
+第一次使用不存在的数据盘 `care-infer` 前缀：
+
+```bash
+nohup conda run --no-capture-output -p /root/autodl-tmp/envs/care-infer python -m vllm.entrypoints.openai.api_server --model ./outputs/dpo_merged --served-model-name dpo --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/vllm_dpo.log 2>&1 &
+echo 8191 > runs/vllm_dpo.pid
+tail -120 runs/vllm_dpo.log
+conda env list
+```
+
+失败为 `EnvironmentLocationNotFound: /root/autodl-tmp/envs/care-infer`，模型未加载。正确路径是 `/root/miniconda3/envs/care-infer`：
+
+```bash
+nohup conda run --no-capture-output -p /root/miniconda3/envs/care-infer python -m vllm.entrypoints.openai.api_server --model ./outputs/dpo_merged --served-model-name dpo --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes > runs/vllm_dpo.log 2>&1 &
+echo 8220 > runs/vllm_dpo.pid
+tail -80 runs/vllm_dpo.log
+tail -60 runs/vllm_dpo.log
+curl -s http://localhost:8001/v1/models
+```
+
+vLLM 0.28.0 在 8001 成功提供 `dpo`，`max_model_len=8192`。第一次评测直接用 shell 的 `python3`，失败为 `ModuleNotFoundError: No module named 'openai'`：
+
+```bash
+python3 scripts/1_run_baseline.py --split test --strategy full --repeats 3 --temperature 0.2 --seed 42 --workers 4 --port 8001 --model dpo --out data/holdout_dpo_full.jsonl --resume
+```
+
+改用推理环境 Python 后完成 27 条，但随后发现它与 base holdout 的 seed 不同，因此 3/27 只作为 `INVALID FOR BEFORE/AFTER CONCLUSION`，文件保留：
+
+```bash
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py --split test --strategy full --repeats 3 --temperature 0.2 --seed 42 --workers 4 --port 8001 --model dpo --out data/holdout_dpo_full.jsonl --resume
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py -h
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py --before data/holdout_base_full.jsonl --after data/holdout_dpo_full.jsonl --out results/dpo_compare.md
+```
+
+### 同 seed 最终结果
+
+```bash
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py --split test --strategy full --repeats 3 --temperature 0.2 --seed 20260902 --workers 4 --port 8001 --model dpo --out data/holdout_dpo_full_seed20260902.jsonl --resume
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py --before data/holdout_base_full.jsonl --after data/holdout_dpo_full_seed20260902.jsonl --out results/dpo_compare_seed20260902.md
+```
+
+| 指标 | Base | DPO | 变化 |
+|---|---:|---:|---:|
+| 任务完成率 | 14.8% (4/27) | 7.4% (2/27) | -7.4pp |
+| 平均步数 | 5.81 | 5.78 | -0.04 |
+| 工具调用率 | 100% | 100% | 0pp |
+| 工具协议错误 | 0% | 0% | 0pp |
+| 平均 prompt 峰值 | 1,234 | 1,230 | -4 |
+
+分类为tool misuse `0/9 -> 0/9`，context forgetting `1/9 -> 1/9`，planning drift `3/9 -> 1/9`。27/27 seed 对齐；21/27 轨迹的完整 tool call 相同；base/DPO 均 27/27 调用 `finish_task`，均没有重复工具名轨迹。
+
+差异轨迹显示 DPO 产生了语义参数退化：`days="2"` 改为 `连续两天/连续两次`，`week="next_week"` 改为 `next`。同时也有一个局部改善：设备任务中 DPO 没有像 base 那样误调被禁止的 `sync_measurements`，但该轨迹仍因结果回传不完整而失败。两条原本成功的 planning drift 轨迹工具序列未变，但 DPO 最终答复漏掉 `ESC-974`/`SFU-974`，因此 checker 失败。
+
+为区分训练不足与泛化失败，在 train 任务上以原 90 条的 seed/温度又评测 DPO：
+
+```bash
+/root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py --split train --strategy full --repeats 6 --temperature 0.7 --seed 4242 --workers 4 --port 8001 --model dpo --out data/train_dpo_full_r6_seed4242.jsonl --resume
+/root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py --before data/train_base_full_r6.jsonl --after data/train_dpo_full_r6_seed4242.jsonl --out results/dpo_train_compare_seed4242.md
+```
+
+base/DPO 均为 22/90（24.4%）；context forgetting `23.3% -> 26.7%`，planning drift `3.3% -> 0%`，tool misuse 维持 46.7%。因此最终结论是：训练内 reward 成功分离，但没有转化为任务完成率，holdout 还出现退化。这不支持 DPO 正向提升声明。
+
+### 停止服务与证据包
+
+`nohup conda run ...` 的 PID 8220 是 wrapper，只 `kill 8220` 后子进程仍占用显存；随后定位 API PID 8229 并停止，显存才归零。
+
+```bash
+ps -fp 8220
+kill 8220
+nvidia-smi
+ps -fp 8274
+ps -fp 8229
+kill 8229
+nvidia-smi
+du -sh data results runs outputs/dpo-qwen15b outputs/dpo_merged
+find outputs/dpo-qwen15b -maxdepth 1 -type f -printf '%f %s bytes\n'
+ls -lh /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+tar -czf /root/autodl-tmp/care-agent-evidence-20260903.tar.gz data results runs config tasks README.md
+ls -lh /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+sha256sum /root/autodl-tmp/care-agent-evidence-20260903.tar.gz
+```
+
+证据包：`/root/autodl-tmp/care-agent-evidence-20260903.tar.gz`，215 KB，SHA-256 `e9ad0708ce2b2764053aa0a37e598fd4c5ccc0d08d8a9bf2dae109a6dfc88347`。`outputs/dpo-qwen15b` 为 527 MB，`outputs/dpo_merged` 为 2.9 GB，因可由配置重现而未放入这个轻量证据包。
+
+### A.16 补充 shell 诊断与历史检查命令
+
+除上述主流程外，本轮还执行了以下只读诊断/检查命令，均未修改实验数据：
+
+```bash
+sed -n '1,130p' scripts/4_to_llamafactory.py
+sed -n '1,240p' config/dpo_qwen15b.yaml
+sed -n '1,180p' config/merge_lora.yaml
+conda env list
+command -v llamafactory-cli || true
+conda run -n care-train python --version
+conda run -n care-train sh -lc 'command -v llamafactory-cli || true'
+nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader
+grep -n -A35 -B10 'care-train\|LLaMA-Factory\|llamafactory' docs/EXPERIMENT_GUIDE.md | head -260
+find vendor -maxdepth 2 -type d 2>/dev/null | head -20
+conda run --no-capture-output -n care-train python -m pip show torch llamafactory transformers accelerate peft
+conda run --no-capture-output -n care-train python -c 'import sys; print(sys.version)'
+conda run --no-capture-output -n care-train python -m pip cache info
+conda run --no-capture-output -n care-train python -m pip cache list | grep -E 'torch|nvidia|transformers' | tail -40
+du -sh /root/miniconda3/envs/care-infer /root/miniconda3/envs/care-train
+conda run --no-capture-output -n care-infer python -m pip show torch transformers accelerate peft | grep -E '^(Name|Version):'
+conda run --no-capture-output -n care-infer python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+find vendor/LLaMA-Factory/examples -path '*dpo*' -name '*.yaml' | head -20
+sed -n '1,220p' vendor/LLaMA-Factory/examples/train_lora/qwen3_lora_dpo.yaml
+ls -lh data
+head -1 data/holdout_dpo_full.jsonl
+head -1 data/train_base_full_r6.jsonl
+sed -n '1,240p' results/holdout_context_compare.md
+history
+fc -l 1700 1918
+fc -l 1300 1600
+fc -l 850 1040
+history | grep -E 'calibration_|holdout_base_|train_base_full_r6|2_attribute.py|pref_pairs_canonical|holdout_context_compare' | tail -120
+```
+
+`history` 输出因 heredoc patch 被展开成大量 diff 行，终端显示有截断；本日志依据未截断的命令尾部、实际产物和日志输出记录命令与结果，没有重写失败历史。
+
+## 2026-09-03 / Run 13：本地结果文档与评测报告收口
+
+更新 `README.md`、`docs/EXPERIMENT_GUIDE.md`和本地 `PROJECT_MEMORY.md`，用观测结果替换所有“待运行”占位，并明确 canonical chosen 的真实来源。同时修复 `scripts/5_evaluate.py` 仍生成“跑完再写”占位结论的问题：报告现在根据完成率、分失效模式和协议错误自动生成保守结论，并显式区分协议正确与任务完成。
+
+本地验证命令：
+
+```bash
+python3 scripts/0_validate_tasks.py
+PYTHONPYCACHEPREFIX=/tmp/care-agent-pycache python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=/tmp/care-agent-pycache python3 -m py_compile scripts/*.py tests/*.py
+git diff --check
+```
+
+实际结果：24 条任务校验通过；6 个单测全部通过；Python 编译通过；`git diff --check` 无输出。本轮未 commit、未 push，也没有重启 AutoDL GPU 服务。
+
+最后执行 `exit`，输出 `logout` 和 `Connection ... closed`，主动关闭空闲 SSH 会话。该操作不会关闭 AutoDL 实例；实例仍需在 AutoDL 控制台手动关机才停止计费。

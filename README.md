@@ -28,7 +28,7 @@
 | `context_forgetting` | 遗忘过敏、授权、单位、时区或最新计划 | 5 / 3 |
 | `planning_drift` | 重复查询、遗漏闭环、越权采取高风险动作 | 5 / 3 |
 
-训练集和测试集按 `scenario_family` 隔离，不通过替换患者 ID 或数字构造同模板测试题。`context_forgetting` 的关键事实由早期工具观测暴露，不直接写进用户提示，以真实测试窗口截断和事件记忆的差异。
+训练集和测试集按 `scenario_family` 隔离。早期调试过的 9 条 test 任务已归档为 `tasks/dev_tasks.jsonl`，最终结果使用全新患者和事件 ID 的 9 条冻结 holdout；冻结后不再根据 holdout 表现修改任务或 checker。`context_forgetting` 的关键事实由早期工具观测暴露，不直接写进用户提示。
 
 ## 实验设计
 
@@ -41,7 +41,7 @@
       |                    |
 上下文策略对照         训练集失败轨迹归因
 full/window/layered         |
-      |                合成 chosen + 双重校验
+      |            canonical chosen + 双重校验
       |                    |
       |               LoRA-DPO
       +---------+----------+
@@ -53,9 +53,9 @@ full/window/layered         |
 
 - `full`：保留完整消息历史。
 - `window`：只保留最近 2 轮工具交互。
-- `layered`：常驻目标与显式约束，将较早动作和事件观测压缩为结构化状态，同时保留最近 1 轮原始交互。
+- `layered`：常驻目标与显式约束，将较早动作和事件观测压缩为结构化状态，同时保留最近 2 轮原始交互。
 
-DPO 使用 Qwen2.5-1.5B-Instruct、LoRA rank 16、`beta=0.1`。偏好对仅来自 `train`；`chosen` 必须同时通过工具协议校验和任务 checker。`test` 在数据构造和训练期间保持不可见。
+DPO 使用 Qwen2.5-1.5B-Instruct、LoRA rank 16、`beta=0.1`。偏好对仅来自 `train` 失败轨迹；`chosen` 是由任务 gold workflow、checker 和确定性 mock 构造的“规则约束 canonical 合成轨迹”，不是人工标注或强模型标注。每条 chosen 必须同时通过工具协议校验和任务 checker。`test` 在数据构造和训练期间保持不可见。
 
 训练前将 chosen/rejected 统一序列化为 Qwen 兼容的 `<tool_call>` 标记，避免用自定义 `CALL(...)` 文本训练、再用原生 Function Calling 评测造成协议错位。
 
@@ -80,34 +80,35 @@ python3 scripts/0_validate_tasks.py
 for strategy in full window layered; do
   python3 scripts/1_run_baseline.py \
     --split test --strategy "$strategy" --repeats 3 --temperature 0.2 \
+    --seed 20260902 \
     --base-url http://localhost:8000/v1 \
-    --out "data/test_${strategy}.jsonl" --resume
+    --out "data/holdout_base_${strategy}.jsonl" --resume
 done
 
 python3 scripts/5_evaluate.py \
-  --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered=data/test_layered.jsonl \
-  --out results/context_compare.md
+  --files full=data/holdout_base_full.jsonl,window=data/holdout_base_window.jsonl,layered=data/holdout_base_layered.jsonl \
+  --out results/holdout_context_compare.md
 ```
 
-采集训练失败并构造偏好对：
+采集训练失败并构造 canonical 偏好对：
 
 ```bash
 python3 scripts/1_run_baseline.py \
   --split train --strategy full --repeats 6 --temperature 0.7 \
   --base-url http://localhost:8000/v1 \
-  --out data/train_full.jsonl --resume
+  --seed 4242 --out data/train_base_full_r6.jsonl --resume
 
 python3 scripts/2_attribute.py \
-  --traj data/train_full.jsonl --out data/badcases_labeled.jsonl
+  --traj data/train_base_full_r6.jsonl --out data/train_badcases_labeled.jsonl
 
-export OPENAI_API_KEY=...
-export OPENAI_BASE_URL=...
 python3 scripts/3_build_preference.py \
-  --badcase data/badcases_labeled.jsonl --out data/pref_pairs.jsonl \
-  --workers 4 --resume
+  --synth-mode canonical \
+  --badcase data/train_badcases_labeled.jsonl \
+  --tasks tasks/tasks.jsonl \
+  --out data/pref_pairs_canonical_v2.jsonl --workers 4
 
 python3 scripts/4_to_llamafactory.py \
-  --pref data/pref_pairs.jsonl --outdir data/lf_data
+  --pref data/pref_pairs_canonical_v2.jsonl --outdir data/lf_data
 ```
 
 安装 LLaMA-Factory 后，从仓库根目录运行；训练配置会直接读取 `data/lf_data/`：
@@ -122,25 +123,31 @@ llamafactory-cli export config/merge_lora.yaml
 ```bash
 python3 scripts/1_run_baseline.py \
   --split test --strategy full --repeats 3 --temperature 0.2 \
-  --port 8001 --model dpo --out data/test_dpo.jsonl --resume
+  --seed 20260902 --port 8001 --model dpo \
+  --out data/holdout_dpo_full_seed20260902.jsonl --resume
 
 python3 scripts/5_evaluate.py \
-  --before data/test_full.jsonl --after data/test_dpo.jsonl \
-  --out results/dpo_compare.md
+  --before data/holdout_base_full.jsonl \
+  --after data/holdout_dpo_full_seed20260902.jsonl \
+  --out results/dpo_compare_seed20260902.md
 ```
 
 完整操作与止损条件见 [`docs/EXPERIMENT_GUIDE.md`](docs/EXPERIMENT_GUIDE.md)，实际执行命令、输出、失败 run 和实验决策见 [`docs/EXPERIMENT_LOG.md`](docs/EXPERIMENT_LOG.md)，任务字段见 [`tasks/schema.md`](tasks/schema.md)。
 
 ## 结果
 
-仓库当前完成了实验设计、受控环境和运行链路重构。首轮上下文对照已在实验日志中保留为地板效应与实现缺陷的诊断 run，不作为正向结论。完成修复后重跑和 DPO 评测后，只报告独立测试集的实际数字：
+最终冻结 holdout 含 9 个独立任务，每任务重复 3 次，即每组 27 条轨迹。上下文策略只改变消息组装；DPO 前后使用相同 `full` 策略、任务、温度与 27/27 对齐的 seed。
 
-| 干预 | tool_misuse | context_forgetting | planning_drift |
-|---|---:|---:|---:|
-| full 基线 | 待运行 | 待运行 | 待运行 |
-| window | 待运行 | 待运行 | 待运行 |
-| layered | 待运行 | 待运行 | 待运行 |
-| DPO（full 上下文） | 待运行 | 待运行 | 待运行 |
+| 干预 | 总完成率 | tool_misuse | context_forgetting | planning_drift | 平均 prompt 峰值 |
+|---|---:|---:|---:|---:|---:|
+| full 基线 | 14.8% (4/27) | 0/9 | 1/9 | 3/9 | 1,234 |
+| window | 0.0% (0/27) | 0/9 | 0/9 | 0/9 | 1,068 |
+| layered | 11.1% (3/27) | 1/9 | 2/9 | 0/9 | 1,205 |
+| DPO（full 上下文） | 7.4% (2/27) | 0/9 | 1/9 | 1/9 | 1,230 |
+
+`window` 节省约 13.5% 的 prompt 峰值，但完成率降为 0；`layered` 仅节省约 2.4%，且没有超过 full。因此这轮不支持“分层上下文带来净改善”，它更明确地显示了朴素截断的风险以及小模型对压缩状态的敏感性。
+
+DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训练内 eval reward accuracy 为 1.0、reward margin 为 0.217，但这种偏好分离没有转化为任务收益：训练任务上 base/DPO 都为 22/90，冻结 holdout 则从 4/27 降至 2/27。对齐轨迹显示两类退化：精确参数复用变成语义改写（如 `2` -> `连续两天`、`next_week` -> `next`），以及最终答复漏掉工具返回 ID。也观察到一个局部改善：DPO 在一条设备轨迹中避免了 base 的禁止同步调用，但仍未使该轨迹通过 checker。这说明“工具协议 0 错误”并不等于“工作流完成”，也为下一轮数据标准提供了明确方向：对 schema 值域、观测引用和结果回传分别设置评测与训练信号。
 
 ## 局限
 
@@ -148,4 +155,5 @@ python3 scripts/5_evaluate.py \
 - 单基座、单次训练 seed，不支持生产级稳定性声明。
 - 测试集每类只有 3 个独立任务；重复采样增加的是轨迹数，不等同于增加独立任务数。
 - checker 能验证关键行为和安全边界，但不能覆盖自然语言质量的全部维度。
-- 强模型生成的 chosen 可能引入风格偏差，因此保留协议校验、规则校验和人工抽检三道质量控制。
+- canonical chosen 由任务规则构造，可验证但风格单一，可能导致对规则文本而非未见场景的过拟合。
+- DPO 只跑了单 seed 和一组超参；本轮负结果不能外推为“DPO 无效”。

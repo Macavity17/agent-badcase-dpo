@@ -34,12 +34,27 @@ from utils import (
 SYSTEM = (
     "你是一个严谨的慢病照护运营助手，可以调用平台工具完成信息读取、记录、提醒和人工升级。\n"
     "要求：\n"
-    "1. 每次只调用一个必要的工具，参数必须严格符合 schema；\n"
+    "1. 这是串行 ReAct 执行：每次响应只调用一个必要工具，参数必须严格符合 schema；\n"
     "2. 保留任务和工具观测中的约束、授权、单位、时区与最新计划状态；\n"
     "3. 不得诊断、开药或自行修改处方；遇到超出权限或紧急情况必须升级人工；\n"
-    "4. 达成目标后立即用自然语言给出最终答案，不要再调用多余工具；\n"
-    "5. 如果信息已足够就直接作答，不要重复调用同一个工具。"
+    "4. 必须完整执行用户目标中明示的工作流；当目标还要求记录、发送、预约或升级时，读取和检索信息不等于完成；\n"
+    "5. 收到工具结果后，若目标未完成，下一次响应必须继续调用工具。不得用‘接下来’、‘将要’、‘请稍等’等自然语言代替工具调用，也不得把 <tool_call> 标记当普通文本输出；\n"
+    "6. 参数必须复用任务或工具结果中的具体值，不得填写‘某ID’、‘转换后的记录’、‘当前单位’、‘高值’等占位词；\n"
+    "7. 只有所有必要动作都完成后才调用 finish_task；不要重复调用同一个工具；\n"
+    "8. finish_task 成功后，用自然语言报告关键结果和工具返回的 ID。"
 )
+
+FINISH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "finish_task",
+        "description": "仅当用户目标中的所有必要动作已完成时调用，用于进入最终答复阶段。",
+        "parameters": {
+            "type": "object", "properties": {},
+            "required": [], "additionalProperties": False,
+        },
+    },
+}
 
 SUMMARIZE_PROMPT = (
     "把下面的智能体执行历史压缩成一段简洁的任务进展摘要（150字以内）。"
@@ -109,26 +124,24 @@ def build_state_block(task, compressed_steps):
     这一层是纯规则维护（不花模型调用、零成本、确定性强）——
     "该常驻的常驻，该滚动的滚动"。
     """
-    lines = ["=== 任务状态（常驻，每步可见）==="]
-    lines.append(f"目标: {task['goal']}")
+    lines = [f"[常驻目标] {task['goal']}"]
     cons = task.get("constraints") or []
     if cons:
-        lines.append("约束（必须遵守）:")
-        lines += [f"  - {c}" for c in cons]
+        lines.append("[必须遵守] " + "；".join(cons))
     done = [s for s in compressed_steps if s.get("tool")]
     if done:
-        lines.append("已压缩的早期步骤（不要重复）:")
-        lines += [f"  {i+1}. {s['tool']}({json.dumps(s.get('args') or {}, ensure_ascii=False)})" for i, s in enumerate(done)]
-    obs = [s.get("observation", "") for s in compressed_steps if s.get("observation")]
-    if obs:
-        lines.append("早期事件记忆（按发生顺序保留）:")
-        lines += [f"  - {o[:180]}" for o in obs]
-    lines.append("=== 继续执行任务 ===")
+        lines.append("[已完成，不要重复]")
+        lines += [
+            f"- {s['tool']}({json.dumps(s.get('args') or {}, ensure_ascii=False)})"
+            f" -> {str(s.get('observation') or '')[:160]}"
+            for s in done
+        ]
+    lines.append("[控制] 根据最近原始结果继续未完成动作；全部完成后才调用 finish_task。")
     return "\n".join(lines)
 
 
-def apply_layered(messages, task, steps_so_far, keep_rounds=1):
-    """分层：稳定任务状态 + 压缩的早期记忆 + 最近一轮原始细节。"""
+def apply_layered(messages, task, steps_so_far, keep_rounds=2):
+    """分层：稳定任务状态 + 压缩的早期记忆 + 最近两轮原始细节。"""
     pairs = _pair_up(messages)
     kept = pairs[-keep_rounds:]
     flat = [m for p in kept for m in p]
@@ -153,6 +166,7 @@ def build_user_message(task):
 def run_one(client, model, task, strategy="full", verbose=False,
             temperature=0.2, seed=None, repeat=0):
     tools = build_tools_payload(task.get("tools") or [])
+    tools.append(FINISH_TOOL)
     valid_names = tool_names(task)
     declared_args = {t["name"]: set((t.get("args") or {}).keys()) for t in (task.get("tools") or [])}
     max_steps = int(task.get("max_steps", 8))
@@ -164,6 +178,7 @@ def run_one(client, model, task, strategy="full", verbose=False,
 
     steps, tool_calls, final_answer = [], [], ""
     context_chars, prompt_tokens = [], []
+    finish_requested = False
 
     for i in range(max_steps):
         # ---- 上下文组织策略：每步调用模型前组装 ----
@@ -181,8 +196,9 @@ def run_one(client, model, task, strategy="full", verbose=False,
         context_chars.append(sum(len(str(m.get("content") or "")) for m in eff))
         try:
             resp = client.chat.completions.create(
-                model=model, messages=eff, tools=tools, tool_choice="auto",
-                temperature=temperature, seed=seed,
+                model=model, messages=eff, tools=tools,
+                tool_choice="none" if finish_requested else "required",
+                parallel_tool_calls=False, temperature=temperature, seed=seed,
             )
         except Exception as e:
             steps.append({"step": i + 1, "type": "error", "error": str(e)})
@@ -196,7 +212,15 @@ def run_one(client, model, task, strategy="full", verbose=False,
 
         if not calls:
             final_answer = msg.content or ""
-            steps.append({"step": i + 1, "type": "final", "content": final_answer})
+            step_type = "final" if finish_requested else "protocol_error"
+            steps.append({"step": i + 1, "type": step_type, "content": final_answer})
+            break
+
+        if finish_requested:
+            steps.append({
+                "step": i + 1, "type": "protocol_error",
+                "error": "finish_task 后仍返回工具调用",
+            })
             break
 
         messages.append({
@@ -213,6 +237,20 @@ def run_one(client, model, task, strategy="full", verbose=False,
                 args = json.loads(c.function.arguments or "{}")
             except Exception:
                 args = {"_raw": c.function.arguments}
+
+            if name == "finish_task":
+                steps.append({
+                    "step": i + 1, "type": "control",
+                    "tool": name, "args": args,
+                    "observation": "{将进入最终答复阶段}",
+                })
+                messages.append({
+                    "role": "tool", "tool_call_id": c.id,
+                    "content": '{"ready_for_final": true}',
+                })
+                finish_requested = True
+                continue
+
             obs = mock_tool_call(name, args, task)
             tool_calls.append({
                 "name": name,
