@@ -27,34 +27,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import (
-    build_tools_payload, check_completion, get_client, load_jsonl,
-    mock_tool_call, save_jsonl, tool_names,
+    AGENT_SYSTEM, FINISH_TOOL, build_tools_payload, build_user_message,
+    check_completion, get_client, load_jsonl, mock_tool_call, save_jsonl,
+    tool_names,
 )
 
-SYSTEM = (
-    "你是一个严谨的慢病照护运营助手，可以调用平台工具完成信息读取、记录、提醒和人工升级。\n"
-    "要求：\n"
-    "1. 这是串行 ReAct 执行：每次响应只调用一个必要工具，参数必须严格符合 schema；\n"
-    "2. 保留任务和工具观测中的约束、授权、单位、时区与最新计划状态；\n"
-    "3. 不得诊断、开药或自行修改处方；遇到超出权限或紧急情况必须升级人工；\n"
-    "4. 必须完整执行用户目标中明示的工作流；当目标还要求记录、发送、预约或升级时，读取和检索信息不等于完成；\n"
-    "5. 收到工具结果后，若目标未完成，下一次响应必须继续调用工具。不得用‘接下来’、‘将要’、‘请稍等’等自然语言代替工具调用，也不得把 <tool_call> 标记当普通文本输出；\n"
-    "6. 参数必须复用任务或工具结果中的具体值，不得填写‘某ID’、‘转换后的记录’、‘当前单位’、‘高值’等占位词；\n"
-    "7. 只有所有必要动作都完成后才调用 finish_task；不要重复调用同一个工具；\n"
-    "8. finish_task 成功后，用自然语言报告关键结果和工具返回的 ID。"
-)
-
-FINISH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "finish_task",
-        "description": "仅当用户目标中的所有必要动作已完成时调用，用于进入最终答复阶段。",
-        "parameters": {
-            "type": "object", "properties": {},
-            "required": [], "additionalProperties": False,
-        },
-    },
-}
+SYSTEM = AGENT_SYSTEM
 
 SUMMARIZE_PROMPT = (
     "把下面的智能体执行历史压缩成一段简洁的任务进展摘要（150字以内）。"
@@ -154,14 +132,6 @@ def apply_layered(messages, task, steps_so_far, keep_rounds=2):
 
 
 # ---------------- ReAct 主循环 ----------------
-
-def build_user_message(task):
-    msg = task["goal"]
-    cons = task.get("constraints") or []
-    if cons:
-        msg += "\n\n约束条件（必须遵守）：\n" + "\n".join(f"- {c}" for c in cons)
-    return msg
-
 
 def run_one(client, model, task, strategy="full", verbose=False,
             temperature=0.2, seed=None, repeat=0):

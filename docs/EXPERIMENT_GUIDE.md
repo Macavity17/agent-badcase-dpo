@@ -397,22 +397,25 @@ scp -P <SSH_PORT> \
 
 ```bash
 cd /root/autodl-tmp/agent-badcase-dpo
+mkdir -p data/round2 runs/round2 results/round2 outputs/round2
 /root/miniconda3/envs/care-infer/bin/python scripts/6_build_teacher_v2.py \
   --badcase data/train_badcases_labeled.jsonl \
   --tasks tasks/tasks.jsonl \
   --specs tasks/teacher_v2_specs.jsonl \
-  --out data/pref_pairs_teacher_v2.jsonl
+  --review experiments/round2/pair_review.jsonl \
+  --split experiments/round2/split.json \
+  --out data/round2/pref_pairs.jsonl
 
 /root/miniconda3/envs/care-infer/bin/python scripts/4_to_llamafactory.py \
-  --pref data/pref_pairs_teacher_v2.jsonl \
-  --outdir data/lf_data_teacher_v2 \
+  --pref data/round2/pref_pairs.jsonl \
+  --outdir data/round2/lf_data \
   --train-config config/dpo_teacher_v2.yaml
 
 /root/miniconda3/envs/care-infer/bin/python scripts/0_validate_tasks.py \
   --tasks tasks/holdout_v2.jsonl
 ```
 
-确认统计为 68 条源 badcase、98 条候选、24 条完全重复、74 条唯一训练 pair；新 holdout 为 9 条且每类 stress 3 条。详细来源与固定哈希见 `docs/DATA_CARD_TEACHER_V2.md`。
+确认统计为 68 条源 badcase、98 条候选、22 个候选行被人工审阅排除、最终 66 条唯一 pair，其中 52 train / 14 eval。再检查 `agent_pref_train.json` 和 `agent_pref_eval.json` 的 `task_id` 分组不重叠；新 holdout 为 9 条且每类 stress 3 条。详细来源与固定哈希见 `docs/DATA_CARD_TEACHER_V2.md`。
 
 第二轮必须使用独立输出路径：
 
@@ -420,15 +423,15 @@ cd /root/autodl-tmp/agent-badcase-dpo
 nohup conda run --no-capture-output \
   -p /root/autodl-tmp/envs/care-train \
   llamafactory-cli train config/dpo_teacher_v2.yaml \
-  > runs/dpo_teacher_v2_train.log 2>&1 &
-echo $! > runs/dpo_teacher_v2_train.pid
+  > runs/round2/dpo_train.log 2>&1 &
+echo $! > runs/round2/dpo_train.pid
 
-tail -f runs/dpo_teacher_v2_train.log
+tail -f runs/round2/dpo_train.log
 
 conda run --no-capture-output \
   -p /root/autodl-tmp/envs/care-train \
   llamafactory-cli export config/merge_teacher_v2.yaml \
-  > runs/merge_teacher_v2.log 2>&1
+  > runs/round2/merge.log 2>&1
 ```
 
 评测前，base 和 teacher-v2 DPO 都必须在 `tasks/holdout_v2.jsonl` 上使用相同的 `repeats=3`、`temperature=0.2`、`seed=20260904`。先运行并保存 base 结果，再运行 DPO；不要查看 base 轨迹后修改 holdout：
@@ -438,18 +441,28 @@ conda run --no-capture-output \
   --tasks tasks/holdout_v2.jsonl --split test --strategy full \
   --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
   --port 8000 --model base \
-  --out data/holdout_v2_base_full_seed20260904.jsonl --resume
+  --out data/round2/holdout_base_full_seed20260904.jsonl --resume
+
+# 保存 base 结果并停止 8000 服务后，再启动第二轮合并模型。
+nohup conda run --no-capture-output \
+  -p /root/autodl-tmp/envs/care-infer \
+  python -m vllm.entrypoints.openai.api_server \
+  --model ./outputs/round2/merged --served-model-name dpo-round2 \
+  --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.85 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  > runs/round2/vllm_dpo.log 2>&1 &
+echo $! > runs/round2/vllm_dpo.pid
 
 /root/miniconda3/envs/care-infer/bin/python scripts/1_run_baseline.py \
   --tasks tasks/holdout_v2.jsonl --split test --strategy full \
   --repeats 3 --temperature 0.2 --seed 20260904 --workers 4 \
-  --port 8001 --model dpo-teacher-v2 \
-  --out data/holdout_v2_dpo_full_seed20260904.jsonl --resume
+  --port 8001 --model dpo-round2 \
+  --out data/round2/holdout_dpo_full_seed20260904.jsonl --resume
 
 /root/miniconda3/envs/care-infer/bin/python scripts/5_evaluate.py \
-  --before data/holdout_v2_base_full_seed20260904.jsonl \
-  --after data/holdout_v2_dpo_full_seed20260904.jsonl \
-  --out results/dpo_teacher_v2_compare_seed20260904.md
+  --before data/round2/holdout_base_full_seed20260904.jsonl \
+  --after data/round2/holdout_dpo_full_seed20260904.jsonl \
+  --out results/round2/dpo_compare_seed20260904.md
 ```
 
 本节只定义预注册执行条件，不代表第二轮已经训练或取得提升。

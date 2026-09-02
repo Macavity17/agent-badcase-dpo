@@ -1,0 +1,10 @@
+{
+  "round_id": "round2",
+  "strategy": "task_grouped_fixed",
+  "eval_task_ids": [
+    "tm_train_002",
+    "cf_train_002",
+    "pd_train_005"
+  ],
+  "holdout_tasks": "tasks/holdout_v2.jsonl"
+}

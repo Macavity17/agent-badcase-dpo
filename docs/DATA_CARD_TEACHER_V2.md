@@ -2,41 +2,44 @@
 
 ## 状态
 
-数据已完成构造与本地校验，尚未用于训练或评测。任何第二轮效果数字都必须在实际运行后填写，不能从数据质量推断。
+数据已完成构造、逐条人工复核与本地校验，尚未用于训练或评测。任何第二轮效果数字都必须在实际运行后填写，不能从数据质量推断。
 
 ## 目标
 
-第一轮将一整条多工具轨迹序列化为单个 assistant response，而线上协议要求每轮只调用一个工具、接收 observation 后再决定下一步。teacher-v2 将训练单元改为“状态 -> 一个下一动作”：
+第一轮将一整条多工具轨迹序列化为单个 assistant response，但运行时要求每轮只调用一个工具、接收 observation 后再决定下一步。teacher-v2 将训练单元改为“状态 -> 一个下一动作”：
 
-- prompt 包含任务、工具定义、正确历史前缀和确定性工具 observation；
-- chosen 是首次分歧点的一个正确工具调用，或 `finish_task` 后的最终答复；
-- rejected 是真实失败轨迹在同一决策点的错误动作；
-- 额外构造 outcome-closure hard negative，训练最终答复复用结果 ID，而不是只说“已完成”。
+- LLaMA-Factory 输入使用 `human -> function_call -> observation` 多轮角色，并通过 `tools` 列携带与运行时一致的工具 schema；
+- chosen 是首次有意义分歧点的一个正确工具调用，或 `finish_task` 后的最终答复；
+- rejected 优先使用第一轮真实失败轨迹在同一决策点的错误动作；
+- 额外构造 outcome-closure hard negative，训练最终答复复用工具返回 ID，而不是只说“已完成”。
 
-## 来源与真实性边界
+## 来源与作者边界
 
 - 源 badcase：第一轮 Qwen2.5-1.5B-Instruct 在 15 个 train 任务上的 68 条真实失败轨迹。
-- teacher 规范：由 OpenAI Codex（GPT-5 family，交互式会话）辅助逐任务编写，固化在 `tasks/teacher_v2_specs.jsonl`。
-- 编译与过滤：`scripts/6_build_teacher_v2.py` 确定性执行。
-- 数据不属于人工专家标注，也不是公司生产数据；不得宣传为医生标注或独立 teacher API 蒸馏。
-- 交互式模型调用本身无法按 API 参数完全复演；可复现对象是已经提交的 teacher 规范、编译器、源 badcase 哈希和最终数据哈希。
+- teacher 规范：由 OpenAI Codex（GPT-5 family，交互式会话）逐任务编写，固化在 `tasks/teacher_v2_specs.jsonl`。
+- 2026-09-03 已将 15 条 workflow、45 条最终答复变体、9 条 holdout 和最终 66 条 pair 全量逐条复核；不再仅是抽样检查。
+- 这是强模型辅助的合成标注，不是独立人类专家标注，也不是公司生产数据或 teacher API 批量蒸馏。
+- 可复现对象是已提交的 teacher 规范、人工审阅清单、编译器、源 badcase 哈希和最终数据哈希。
 
 全部患者、工具、观察和结果均为合成数据。
 
-## 规模
+## 规模与切分
 
 | 项目 | 数量 |
 |---|---:|
 | 源 badcase | 68 |
 | 编译候选 pair | 98 |
-| 完全重复候选 | 24 |
-| 最终唯一训练 pair | 74 |
-| 真实 badcase 首次分歧 | 44 |
+| 人工规则排除的候选行 | 22 |
+| 审阅与去重后的唯一 pair | 66 |
+| 真实 badcase 首次分歧 | 36 |
 | teacher outcome-closure hard negative | 30 |
-| 工具动作 chosen | 38 |
-| 最终答复 chosen | 36 |
+| 工具动作 chosen | 27 |
+| 最终答复 chosen | 39 |
+| 任务级 train / eval | 52 / 14 |
 
-按任务 stress 统计：`tool_misuse=17`、`context_forgetting=29`、`planning_drift=28`。按原 badcase 归因统计的唯一 pair 为 `tool_misuse=5`、`context_forgetting=19`、`planning_drift=20`，另有 30 条 `workflow_closure`。
+按任务 stress 统计：`tool_misuse=20`、`context_forgetting=24`、`planning_drift=22`。人工审阅排除近义文案、等价序列化、未声明时间窗口、未定义枚举等不能证明 rejected 更差的偏好，原始候选和理由仍保留在 audit 文件。
+
+`experiments/round2/split.json` 固定 3 个 eval task，每类 stress 各 1 个。同一 `task_id` 不会同时出现在 train/eval，避免同任务不同 repeat 随机泄漏导致 reward accuracy 虚高。
 
 ## 质量规则
 
@@ -44,16 +47,19 @@
 2. teacher workflow 的工具名与参数键必须严格匹配任务 schema。
 3. 完整 teacher workflow 加任一最终答复必须通过任务 checker。
 4. ID 必须来自初始任务或此前工具 observation；未出现的 ID 会使构造失败。
-5. `reason`、`message`、`outcome`、`instruction` 等自由文本允许合理措辞差异，避免学习无意义的文案偏好。
-6. ID、枚举、时间、数值、单位和结构化 observation 值保持严格比较。
-7. 空 chosen/rejected、相同 pair、占位文本和不完整 grounding 均不得进入训练集。
-8. 98 条候选完整保存在 audit 文件，训练集对相同 prompt/chosen/rejected 去重为 74 条。
+5. 只有能归因到工具选择、工作流闭环、明确值约束或观察丢失的差异才进入训练。
+6. 空 chosen/rejected、相同 pair、占位文本和不完整 grounding 均不得进入训练集。
+7. 所有候选完整保存在 audit 文件，审阅决定固化在 `experiments/round2/pair_review.jsonl`。
 
 ## 第二份盲测集
 
 `tasks/holdout_v2.jsonl` 包含 9 个新任务，三类 stress 各 3 条。患者 ID 为 `P9601-P9803`，9 个 `scenario_family` 均不与 train、dev 或第一份 holdout 重合。
 
-第二份 holdout 只完成字段、checker 引用、类别平衡、ID/family 隔离等结构校验；没有用 base 或 DPO 模型运行，也没有根据模型表现修改。第二轮训练前应先固定其 SHA-256，之后 base 与 DPO 使用完全相同的 seed 运行。由于任务由项目作者构造，它是模型未见的评测集，不是外部公开 benchmark。
+除字段、checker 引用、平衡与隔离外，每个 holdout 还生成了一条无占位符的 canonical trace 并通过 checker。但它从未用 base 或 DPO 模型运行，也未根据模型表现修改。它是模型未见的作者合成评测集，不是外部公开 benchmark。
+
+## 轮次隔离
+
+第一轮路径保持不变；第二轮的派生数据、日志、模型和结果分别只写入 `data/round2/`、`runs/round2/`、`outputs/round2/` 和 `results/round2/`。两轮完整路径清单见 `experiments/round1/README.md` 和 `experiments/round2/README.md`。
 
 ## 构造与导出
 
@@ -62,11 +68,13 @@ python3 scripts/6_build_teacher_v2.py \
   --badcase data/train_badcases_labeled.jsonl \
   --tasks tasks/tasks.jsonl \
   --specs tasks/teacher_v2_specs.jsonl \
-  --out data/pref_pairs_teacher_v2.jsonl
+  --review experiments/round2/pair_review.jsonl \
+  --split experiments/round2/split.json \
+  --out data/round2/pref_pairs.jsonl
 
 python3 scripts/4_to_llamafactory.py \
-  --pref data/pref_pairs_teacher_v2.jsonl \
-  --outdir data/lf_data_teacher_v2 \
+  --pref data/round2/pref_pairs.jsonl \
+  --outdir data/round2/lf_data \
   --train-config config/dpo_teacher_v2.yaml
 
 python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
@@ -76,19 +84,22 @@ python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
 
 ```text
 source badcases                         3f90aff256e085ee418a9d2af0accd625cf3d107580632d8bc373d25fc148c7d
-pref_pairs_teacher_v2.jsonl             8407d7d2211b41608be53b142f9c6ceea32f270294c35299c250eaeca007d6bf
-pref_pairs_teacher_v2.audit.jsonl       8b1ca977f97c2836e000f26390487d9f14250f115f7af1d632183c728ad0138f
-LLaMA-Factory agent_pref.json           4db6cb98713e2776b575f09e3e768d3b1002cb4a3b464cec82e14222b31dc638
-teacher_v2_specs.jsonl                  475a96c6bf7b473238ddd7ba825410e419b8e1d2e93f6895a02b4ede708e623e
-holdout_v2.jsonl                        f2f251e43df49d0a7f999513b31b9078a2f48372aa8564d7236e817467b7eee2
+data/round2/pref_pairs.jsonl            f25a9f90acb9c689bdd0a016d7a8766e197414e4927cd6c9a7d0540b824055f1
+data/round2/pref_pairs.audit.jsonl      2a7ee3151f896c57f8250d17601e5708830684204c0092b1f154be753de887cf
+LLaMA-Factory train                     c5ef211d5cde49c08783774640b55b982c63c153d288f03c763239ff11d0ac33
+LLaMA-Factory eval                      7cc74cf0458c0722f54d8af65048317cea1b2663cbc983c1aaf03f1ff850af34
+teacher_v2_specs.jsonl                  9fc9f65175e7fadcf96b0be63cc1ad226a1741d8055a44ba8227b0a045c59a58
+holdout_v2.jsonl                        78d6cc68b8954c6bc9c3ded1daf6a71a129ee3daf8397bfa48bcc963b21769b9
+pair_review.jsonl                       862b459fe5874fd57cf4b09178f0ac0f2c8a34fe9614bf0233d2739f7143f827
+split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187a4568a349ed1109558680cc7
 ```
 
-`data/` 被 Git 忽略，训练数据和 audit 文件需随实验 evidence archive 备份；teacher 规范、编译器、holdout 和本数据卡进入 Git。
+`data/` 被 Git 忽略，训练数据和 audit 文件需随实验 evidence archive 备份；teacher 规范、审阅清单、切分、holdout 和本数据卡进入 Git。
 
 ## 已知局限
 
-- 74 条仍是小规模、单领域合成偏好数据。
+- 66 条仍是小规模、单领域合成偏好数据。
 - 30 条 closure rejected 是 teacher 构造的通用弱答复，不是线上采样。
-- 不同任务的唯一 pair 数量不完全均衡，保留了原 badcase 分布。
-- state-action prompt 是显式文本化的工具历史，仍不是运行时 OpenAI 消息数组的完全同构表示。
+- 不同任务的 pair 数不均衡，eval 仅 3 个独立任务；reward accuracy 只是训练诊断，不是效果结论。
+- 多轮 ShareGPT 角色与工具 schema 已对齐运行时语义，但 LLaMA-Factory/Qwen 模板与 vLLM/OpenAI 协议的底层 token 仍不保证逐 token 完全同构。
 - 只有实际训练并在固定 holdout-v2 上比较后，才能判断它是否修复第一轮退化。

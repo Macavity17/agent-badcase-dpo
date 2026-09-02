@@ -1,0 +1,17 @@
+{"pair_id":"af44252082982e4f","decision":"exclude","reason":"context 只是语序和标点改写，不构成明确错误偏好"}
+{"pair_id":"315b1b35f33d3037","decision":"exclude","reason":"context 只是语序和标点改写，不构成明确错误偏好"}
+{"pair_id":"57803e40371a2a76","decision":"exclude","reason":"records 保留了相同单位和数值，仅序列化格式不同"}
+{"pair_id":"243a0066494f5450","decision":"exclude","reason":"records 保留了相同单位和数值，仅序列化格式不同"}
+{"pair_id":"9f47afd30464c35e","decision":"exclude","reason":"history 使用了等价文本摘要，工具 schema 未规定必须是 JSON"}
+{"pair_id":"d804dae16b7e3b36","decision":"exclude","reason":"任务未规定近期窗口必须是 24 小时，1/2 小时不能仅凭教师偏好判错"}
+{"pair_id":"a565a8262c8d3157","decision":"exclude","reason":"任务未规定近期窗口必须是 24 小时，1/2 小时不能仅凭教师偏好判错"}
+{"pair_id":"238b541ec92b78d3","decision":"exclude","reason":"week=current 与 week=本周语义等价，schema 未定义枚举"}
+{"pair_id":"8cf8d945790f4e9f","decision":"exclude","reason":"status 参数没有枚举协议，中文状态不能仅凭教师偏好判错"}
+{"pair_id":"533312b71b4e91bb","decision":"exclude","reason":"status 参数没有枚举协议，中文状态不能仅凭教师偏好判错"}
+{"pair_id":"a5d140c895447a3d","decision":"exclude","reason":"status 参数没有枚举协议，中文状态不能仅凭教师偏好判错"}
+{"pair_id":"2da80dee51fab6ab","decision":"exclude","reason":"与已排除的近期窗口偏好相同；去重前的另一 source repeat"}
+{"pair_id":"4e0f3650ee1cc5b0","decision":"exclude","reason":"与已排除的本周/current 偏好相同；去重前的另一 source repeat"}
+{"pair_id":"11eaefafdc53ef3d","decision":"exclude","reason":"与已排除的未定义 status 枚举偏好相同；去重前的另一 source repeat"}
+{"match":{"task_id":"pd_train_001","decision_index":0},"decision":"exclude","reason":"整类排除：任务未规定近期窗口必须是 24 小时"}
+{"match":{"task_id":"pd_train_003","decision_index":0},"decision":"exclude","reason":"整类排除：week=current 与 week=本周语义等价且 schema 未定义枚举"}
+{"match":{"task_id":"pd_train_004","decision_index":3},"decision":"exclude","reason":"整类排除：status 参数没有枚举协议"}

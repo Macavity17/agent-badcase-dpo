@@ -15,7 +15,10 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import check_completion, load_jsonl, save_jsonl
+from utils import (
+    AGENT_SYSTEM, FINISH_TOOL, build_tools_payload, build_user_message,
+    check_completion, load_jsonl, save_jsonl,
+)
 
 
 TEACHER = "OpenAI Codex (GPT-5 family, interactive session)"
@@ -53,6 +56,18 @@ def render_action(action):
     if action["kind"] == "tool":
         return render_tool_call(action["tool"], action.get("args") or {})
     return action.get("content") or ""
+
+
+def action_message(action):
+    if action["kind"] == "tool":
+        return {
+            "from": "function_call",
+            "value": compact({
+                "name": action["tool"],
+                "arguments": action.get("args") or {},
+            }),
+        }
+    return {"from": "gpt", "value": action.get("content") or ""}
 
 
 def actions_equal(left, right):
@@ -193,6 +208,27 @@ def build_prompt(task, prefix):
     return "\n".join(lines)
 
 
+def build_context_messages(task, prefix):
+    messages = [{"from": "human", "value": build_user_message(task)}]
+    for action in prefix:
+        if action["kind"] != "tool":
+            continue
+        messages.append(action_message(action))
+        messages.append({
+            "from": "observation",
+            "value": compact(observation_for(task, action["tool"])),
+        })
+    return messages
+
+
+def task_tools(task):
+    return build_tools_payload(task.get("tools") or []) + [FINISH_TOOL]
+
+
+def review_matches(row, match):
+    return all(row.get(key) == value for key, value in match.items())
+
+
 def grounding_audit(task, prefix, chosen):
     initial = "\n".join([
         task.get("goal", ""),
@@ -279,6 +315,9 @@ def build_closure_pairs(task, spec, source_hash):
             "teacher": TEACHER,
             "generation_method": "teacher-authored outcome report versus generic closure",
             "source_badcase_sha256": source_hash,
+            "system": AGENT_SYSTEM,
+            "context_messages": build_context_messages(task, prefix),
+            "tools": task_tools(task),
         })
     return rows
 
@@ -324,6 +363,9 @@ def build_pair(task, spec, traj, source_hash):
         "teacher": TEACHER,
         "generation_method": "teacher-authored workflow compiled at first divergence",
         "source_badcase_sha256": source_hash,
+        "system": AGENT_SYSTEM,
+        "context_messages": build_context_messages(task, prefix),
+        "tools": task_tools(task),
     }, None
 
 
@@ -332,7 +374,9 @@ def main():
     parser.add_argument("--badcase", default="data/train_badcases_labeled.jsonl")
     parser.add_argument("--tasks", default="tasks/tasks.jsonl")
     parser.add_argument("--specs", default="tasks/teacher_v2_specs.jsonl")
-    parser.add_argument("--out", default="data/pref_pairs_teacher_v2.jsonl")
+    parser.add_argument("--review", default="experiments/round2/pair_review.jsonl")
+    parser.add_argument("--split", default="experiments/round2/split.json")
+    parser.add_argument("--out", default="data/round2/pref_pairs.jsonl")
     args = parser.parse_args()
 
     task_rows = load_jsonl(args.tasks)
@@ -340,6 +384,10 @@ def main():
     spec_rows = load_jsonl(args.specs)
     specs = {spec["task_id"]: spec for spec in spec_rows}
     badcases = load_jsonl(args.badcase)
+    review_rows = load_jsonl(args.review)
+    with open(args.split, encoding="utf-8") as handle:
+        split_spec = json.load(handle)
+    eval_task_ids = set(split_spec["eval_task_ids"])
 
     errors = []
     if set(tasks) != set(specs):
@@ -379,12 +427,29 @@ def main():
         -1 if row["source_repeat"] is None else row["source_repeat"],
         row["pair_id"],
     ))
+    review = {row["pair_id"]: row for row in review_rows if row.get("pair_id")}
+    review_rules = [row for row in review_rows if row.get("match")]
+    unknown_review_ids = sorted(set(review) - {row["pair_id"] for row in pairs})
+    if unknown_review_ids:
+        raise SystemExit(f"人工审阅清单含未知 pair_id: {unknown_review_ids}")
+    for row in pairs:
+        decision = review.get(row["pair_id"])
+        if decision is None:
+            decision = next((
+                rule for rule in review_rules
+                if review_matches(row, rule["match"])
+            ), None)
+        row["review_status"] = decision.get("decision", "include") if decision else "include"
+        row["review_reason"] = decision.get("reason") if decision else None
+        row["dataset_split"] = "eval" if row["task_id"] in eval_task_ids else "train"
     audit_path = os.path.splitext(args.out)[0] + ".audit.jsonl"
     save_jsonl(pairs, audit_path)
 
     unique_pairs = []
     seen_triplets = set()
     for row in pairs:
+        if row["review_status"] == "exclude":
+            continue
         key = (row["prompt"], row["chosen"], row["rejected"])
         if key in seen_triplets:
             continue
@@ -402,6 +467,12 @@ def main():
         "dropped": len(dropped),
         "unique_triplets": len(duplicate_keys),
         "duplicate_triplets": sum(count - 1 for count in duplicate_keys.values()),
+        "manual_review_excluded": sum(
+            row["review_status"] == "exclude" for row in pairs
+        ),
+        "by_dataset_split": dict(Counter(
+            row["dataset_split"] for row in unique_pairs
+        )),
         "by_stress": dict(Counter(row["stress"] for row in unique_pairs)),
         "by_attr_label": dict(Counter(row["attr_label"] for row in unique_pairs)),
         "by_decision_kind": dict(Counter(row["decision_kind"] for row in unique_pairs)),

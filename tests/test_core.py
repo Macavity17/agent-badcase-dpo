@@ -35,6 +35,12 @@ TEACHER_V2_SPEC = importlib.util.spec_from_file_location(
 teacher_v2 = importlib.util.module_from_spec(TEACHER_V2_SPEC)
 TEACHER_V2_SPEC.loader.exec_module(teacher_v2)
 
+LLAMAFACTORY_SPEC = importlib.util.spec_from_file_location(
+    "llamafactory_export", os.path.join(ROOT, "scripts", "4_to_llamafactory.py")
+)
+llamafactory_export = importlib.util.module_from_spec(LLAMAFACTORY_SPEC)
+LLAMAFACTORY_SPEC.loader.exec_module(llamafactory_export)
+
 
 class CheckerTest(unittest.TestCase):
     def test_layered_context_compresses_old_rounds(self):
@@ -194,6 +200,52 @@ class CheckerTest(unittest.TestCase):
                 item.get("source") is not None
                 for row in closure for item in row["chosen_grounding"]
             ))
+
+        self.assertEqual(
+            [step["tool"] for step in specs["tm_train_003"]["gold_steps"]],
+            ["create_reminder"],
+        )
+
+    def test_teacher_v2_uses_runtime_shaped_context(self):
+        task = next(
+            row for row in load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
+            if row["task_id"] == "cf_train_001"
+        )
+        spec = next(
+            row for row in load_jsonl(os.path.join(ROOT, "tasks", "teacher_v2_specs.jsonl"))
+            if row["task_id"] == task["task_id"]
+        )
+        prefix = teacher_v2.gold_actions(spec, 0)[:2]
+        messages = teacher_v2.build_context_messages(task, prefix)
+        self.assertEqual(
+            [message["from"] for message in messages],
+            ["human", "function_call", "observation", "function_call", "observation"],
+        )
+        self.assertIn("get_patient_profile", messages[1]["value"])
+        self.assertIn("花生", messages[2]["value"])
+        self.assertTrue(any(
+            tool["function"]["name"] == "finish_task"
+            for tool in teacher_v2.task_tools(task)
+        ))
+
+    def test_round2_split_is_task_grouped_and_balanced(self):
+        with open(os.path.join(ROOT, "experiments", "round2", "split.json"), encoding="utf-8") as handle:
+            split = __import__("json").load(handle)
+        tasks = {
+            row["task_id"]: row
+            for row in load_jsonl(os.path.join(ROOT, "tasks", "tasks.jsonl"))
+        }
+        eval_ids = split["eval_task_ids"]
+        self.assertEqual(len(eval_ids), len(set(eval_ids)))
+        self.assertEqual(
+            {tasks[task_id]["stress"] for task_id in eval_ids},
+            {"tool_misuse", "context_forgetting", "planning_drift"},
+        )
+
+    def test_llamafactory_export_uses_function_role(self):
+        action = {"kind": "tool", "tool": "finish_task", "args": {}}
+        value = llamafactory_export._response_value("ignored", action)
+        self.assertEqual(value, '{"name":"finish_task","arguments":{}}')
 
     def test_reports_generate_evidence_bounded_conclusions(self):
         before = {

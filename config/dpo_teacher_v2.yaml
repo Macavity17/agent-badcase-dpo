@@ -12,15 +12,16 @@ lora_target: all
 pref_beta: 0.1
 pref_loss: sigmoid
 
-dataset: agent_pref
-dataset_dir: ./data/lf_data_teacher_v2
+dataset: agent_pref_train
+eval_dataset: agent_pref_eval
+dataset_dir: ./data/round2/lf_data
 template: qwen
 cutoff_len: 4096
 max_samples: 2000
 overwrite_cache: true
 preprocessing_num_workers: 8
 
-output_dir: ./outputs/dpo-teacher-v2
+output_dir: ./outputs/round2/dpo-adapter
 logging_steps: 2
 save_steps: 5
 save_total_limit: 2
@@ -36,7 +37,6 @@ warmup_ratio: 0.1
 bf16: true
 gradient_checkpointing: true
 
-val_size: 0.1
 per_device_eval_batch_size: 2
 eval_strategy: steps
 eval_steps: 5

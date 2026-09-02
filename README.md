@@ -151,9 +151,9 @@ DPO 使用 68 对 canonical 偏好数据训练 3 epoch，44.46 秒完成。训�
 
 ### 第二轮数据修复（已准备，尚未训练）
 
-针对第一轮暴露的训练/运行协议错位，第二轮不再把整条多工具轨迹放进单个 assistant response，而是把 68 条 train badcase 编译成首次分歧点的“状态 -> 一个下一动作”偏好。去除自由文本措辞伪差异和 24 条完全重复候选后，得到 44 条真实 badcase 决策 pair；另加入 30 条结果回传 hard negative，共 74 条唯一训练 pair（工具动作 38、最终答复 36）。
+针对第一轮暴露的训练/运行协议错位，第二轮不再把整条多工具轨迹放进单个 assistant response。每条数据现在使用原生 `human -> function_call -> observation` 多轮结构与工具 schema，只学习首次有意义分歧点的一个下一动作。98 条候选中，22 个候选行因近义措辞、等价序列化或 schema 未定义枚举等弱偏好被人工规则排除；审阅去重后保留 66 条，其中 36 条来自真实 badcase 分歧，30 条是结果回传 hard negative。
 
-同时新建了 9 条未运行的 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。当前只完成数据构造与结构校验，没有第二轮训练结果。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
+训练内部另按 `task_id` 固定为 52 train / 14 eval，不再随机拆分同一任务的 pair。同时新建了 9 条未运行的 `holdout_v2`，三类失效各 3 条，患者 ID 和 scenario family 均不与 train/dev/旧 holdout 重合。第二轮所有派生数据、日志、模型和结果都进入独立 `round2/` 路径，不覆盖第一轮。当前没有第二轮训练结果。来源、过滤规则、哈希和局限见 [`docs/DATA_CARD_TEACHER_V2.md`](docs/DATA_CARD_TEACHER_V2.md)。
 
 ## 局限
 

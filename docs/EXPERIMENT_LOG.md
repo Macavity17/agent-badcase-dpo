@@ -1222,3 +1222,116 @@ git rev-parse HEAD
 ```
 
 输出：Python `3.11.16`；24 个任务通过字段、checker 引用和场景族隔离校验；6 个单测全部通过；`git diff --check` 无输出；状态仅为 `?? vendor/`；HEAD 为 `956780eaa433c3710c83f2aaaf05d029db58588a`。至此，Mac、GitHub 与服务器的受 Git 管理代码对齐；服务器独有的模型、训练输出、原始 JSONL、证据包和 LLaMA-Factory `vendor/` 目录仍保留在服务器。
+
+## 2026-09-03 / Run 16：teacher-v2 全量审阅、协议对齐与轮次隔离
+
+### 起点与 GitHub 同步
+
+本地起点为 `428c092 feat: prepare grounded DPO round two`，开始时 `origin/main...HEAD` 为 `0 0`、工作区干净。第一次重试 push 因本机 DNS 失败：
+
+```bash
+git push --verbose origin main
+```
+
+```text
+fatal: unable to access 'https://github.com/Macavity17/agent-badcase-dpo.git/': Could not resolve host: github.com
+```
+
+使用当前允许的网络通道重试后成功，远端返回：
+
+```text
+= [up to date]      main -> main
+Everything up-to-date
+```
+
+这证明 `428c092` 早已在 GitHub，当时没有新提交需上传。
+
+### teacher 作者性与全量审阅
+
+由当前交互式 Codex 会话编写了 `tasks/teacher_v2_specs.jsonl` 中的 15 条 workflow 与 45 条最终答复变体，并编写了 `tasks/holdout_v2.jsonl` 中的 9 条任务。上一版只完成了程序校验与代表样本人工检查，因此不能追溯声称当时已“逐字复核”。本轮实际完成了：
+
+- 逐条读取 15 条 teacher spec 的全部 `gold_steps` 与 45 条 `final_variants`；
+- 逐条对照原 train task 的 goal、constraints、工具参数、mock response 与 checker；
+- 逐条读取 9 条 holdout 的 goal、latent constraint、工具、mock 和 checker；
+- 逐条读取当时的 74 条 pair 的 chosen/rejected，识别出近义措辞、等价记录序列化、未声明时间窗口和未定义枚举等弱偏好；
+- 修正 `tm_train_003` teacher workflow：目标明确要求新建提醒，不应强制一次不必要的 `list_reminders`。修正后的有效分歧是重复创建与最终答复漏报 `15:00`。
+
+审阅决定写入 `experiments/round2/pair_review.jsonl`，候选不删除，完整保留在 audit 中。审阅规则最终排除 22 个候选行；去重后得到 66 条唯一 pair，其中 36 条为真实 badcase 首次分歧、30 条为 closure hard negative，27 条 chosen 是工具动作、39 条是最终答复。
+
+### 基于第一轮的结构调整
+
+1. 训练数据不再将工具历史内联到单个 human prompt；改为 LLaMA-Factory 原生 ShareGPT `human/function_call/observation` 多轮角色，并携带运行时工具 schema。
+2. 运行与训练共用 `AGENT_SYSTEM`、`FINISH_TOOL` 和初始用户消息组装函数，减少两处协议漂移。
+3. 删除 `val_size: 0.1`，用 `experiments/round2/split.json` 固定 3 个 eval task，每类 stress 各 1 个。最终为 52 train / 14 eval，task overlap 为空。
+4. 第二轮输出统一改为 `data/round2/`、`runs/round2/`、`outputs/round2/`、`results/round2/`。第一轮原路径不移动、不覆盖，两轮清单分别写入 `experiments/round1/README.md` 和 `experiments/round2/README.md`。
+5. 收紧三个 holdout 语义检查：晨间提醒标题、家属授权通知的实际日期/地点/交通内容、设备工单的错误原因/通知/状态。9 条 canonical trace 在收紧后仍全部通过 checker。
+
+### LLaMA-Factory 版本能力核验与服务器完整命令账本
+
+提交 `428c092` 后曾在服务器两次试图同步 GitHub，均没有改变服务器 checkout：
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+git pull --ff-only origin main
+git pull --ff-only origin main
+```
+
+第一次返回 `curl 16 Error in the HTTP2 framing layer`；第二次超过 90 秒无输出，手动 `Ctrl+C` 中断。没有执行第二轮数据构造或训练。
+
+本轮为确认固定在服务器的 LLaMA-Factory `0.9.6.dev0` 是否真正支持多轮工具偏好与显式 eval dataset，只读执行了以下全部 shell 命令：
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+rg -n "eval_dataset|ranking|Role\.OBSERVATION|observation|function_call" vendor/LLaMA-Factory/src/llamafactory/data vendor/LLaMA-Factory/src/llamafactory/hparams | head -n 160
+grep -RInE "eval_dataset|ranking|Role\.OBSERVATION|observation|function_call" vendor/LLaMA-Factory/src/llamafactory/data vendor/LLaMA-Factory/src/llamafactory/hparams
+sed -n '120,215p' vendor/LLaMA-Factory/src/llamafactory/data/converter.py
+grep -n "name=\"qwen\"" vendor/LLaMA-Factory/src/llamafactory/data/template.py
+sed -n '2138,2178p' vendor/LLaMA-Factory/src/llamafactory/data/template.py
+grep -RIn "class FunctionFormatter" vendor/LLaMA-Factory/src/llamafactory/data
+sed -n '80,125p' vendor/LLaMA-Factory/src/llamafactory/data/formatter.py
+exit
+```
+
+`rg` 命令失败为 `rg: command not found`，随后按原样使用 `grep` 继续。源码确认：ShareGPT converter 接受 `observation` 和 `function_call` 交替角色；Qwen template 对工具观察使用 `<tool_response>`；DataArguments 支持 `eval_dataset`，且当它存在时明确禁止同时设置 `val_size`。本次 SSH 连接主动 `exit`，未启动模型、未占用 GPU、未修改服务器文件。
+
+### 本地重建、失败记录与验证
+
+主要重建命令：
+
+```bash
+python3 scripts/6_build_teacher_v2.py --badcase data/train_badcases_labeled.jsonl --tasks tasks/tasks.jsonl --specs tasks/teacher_v2_specs.jsonl --review experiments/round2/pair_review.jsonl --split experiments/round2/split.json --out data/round2/pref_pairs.jsonl
+python3 scripts/4_to_llamafactory.py --pref data/round2/pref_pairs.jsonl --outdir data/round2/lf_data --train-config config/dpo_teacher_v2.yaml
+python3 scripts/0_validate_tasks.py --tasks tasks/holdout_v2.jsonl
+```
+
+第一次直接执行 `python3 -m py_compile ...` 失败，原因是 macOS 系统 Python 试图写入无权限的 `/Users/paxon/Library/Caches/com.apple.python`，不是语法错误。使用独立临时 cache 后通过：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/agent-badcase-pycache python3 -m py_compile scripts/0_validate_tasks.py scripts/1_run_baseline.py scripts/3_build_preference.py scripts/4_to_llamafactory.py scripts/6_build_teacher_v2.py scripts/utils.py
+python3 -m unittest discover -s tests -v
+git diff --check
+```
+
+输出：13 个单测全部通过；Python 编译通过；`git diff --check` 无输出；9 个 holdout task 校验通过，三类 stress 各 3 个；9 条无占位 canonical trace 全部通过收紧后 checker。本轮没有运行第二轮 DPO，也没有产生任何第二轮效果数字。
+
+本地系统 Python 未安装 PyYAML，首个 YAML 校验脚本因 `PyYAML unavailable` 退出。改用 macOS 自带 Ruby/Psych 时，第一条 `YAML.safe_load_file` 又因当前 Psych 版本没有该方法失败。最终对仓库内可信配置使用以下命令解析成功：
+
+```bash
+ruby -e 'require "yaml"; ARGV.each { |path| obj = YAML.load_file(path); puts "#{path} ok #{obj["dataset"] || "merge"} #{obj["eval_dataset"] || ""}" }' config/dpo_teacher_v2.yaml config/merge_teacher_v2.yaml
+```
+
+输出确认训练配置为 `agent_pref_train / agent_pref_eval`，merge 配置也可正常解析。
+
+最终固定哈希：
+
+```text
+source badcases                         3f90aff256e085ee418a9d2af0accd625cf3d107580632d8bc373d25fc148c7d
+data/round2/pref_pairs.jsonl            f25a9f90acb9c689bdd0a016d7a8766e197414e4927cd6c9a7d0540b824055f1
+data/round2/pref_pairs.audit.jsonl      2a7ee3151f896c57f8250d17601e5708830684204c0092b1f154be753de887cf
+LLaMA-Factory train                     c5ef211d5cde49c08783774640b55b982c63c153d288f03c763239ff11d0ac33
+LLaMA-Factory eval                      7cc74cf0458c0722f54d8af65048317cea1b2663cbc983c1aaf03f1ff850af34
+teacher_v2_specs.jsonl                  9fc9f65175e7fadcf96b0be63cc1ad226a1741d8055a44ba8227b0a045c59a58
+holdout_v2.jsonl                        78d6cc68b8954c6bc9c3ded1daf6a71a129ee3daf8397bfa48bcc963b21769b9
+pair_review.jsonl                       862b459fe5874fd57cf4b09178f0ac0f2c8a34fe9614bf0233d2739f7143f827
+split.json                              1fb2d39c939f3b5b437f37fac51c4a0f47406187a4568a349ed1109558680cc7
+```
