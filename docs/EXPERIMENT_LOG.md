@@ -1430,3 +1430,59 @@ git diff --stat
 ```
 
 最终结果：18 个单测全部通过；Python 编译无错误；24 条主任务与 9 条 holdout-v2 均通过字段、checker 引用和场景隔离校验；CLI help 正常；`git diff --check` 无输出。本轮没有连接服务器，没有执行任何服务器 shell 命令，没有启动模型服务、DPO 训练、状态动作推理或 holdout 推理，也没有产生或填写第二轮效果数字。
+
+## 2026-09-03 / Run 18：服务器 Git 同步至第二轮评测提交
+
+### 目标与保护边界
+
+用户要求先将服务器更新到当前仓库再进行第二轮。开始前明确：只同步 Git 管理的代码与文档；不删除、移动或覆盖第一轮的 adapter、merged model、JSONL、运行日志、证据包、`vendor/` 或任何 GPU 进程。第二轮的 `outputs/round2/`、`runs/round2/`、`data/round2/` 与 `results/round2/` 路径继续独立于第一轮。
+
+### 服务器完整命令账本
+
+以下是本轮在服务器执行的全部 shell 命令，按实际顺序保留失败、等待和重试。SSH 凭据未记录。
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+git status --short
+git rev-parse HEAD
+git rev-parse origin/main
+git fetch origin main
+git config http.version HTTP/1.1
+git fetch origin main
+# 等待 90 秒无新增输出后发送 Ctrl+C 中断第二次 fetch
+git rev-parse origin/main
+git cat-file -e c1cd94d^{commit} && echo commit-object-present || true
+git fsck --connectivity-only c1cd94d
+git merge-base --is-ancestor HEAD c1cd94d && echo fast-forward-safe
+git bundle verify /root/autodl-tmp/agent-badcase-dpo-c1cd94d.bundle
+git fetch /root/autodl-tmp/agent-badcase-dpo-c1cd94d.bundle HEAD:refs/remotes/origin/main
+git fsck --connectivity-only origin/main
+git merge --ff-only origin/main
+git status --short
+git rev-parse HEAD
+git rev-parse origin/main
+exit
+```
+
+初始状态：HEAD 与服务器的 `origin/main` 都是 `adb596c3825394c9b67d64fcbf39cd2ab6148438`，`git status --short` 仅显示预先存在的 `?? vendor/`。第一条 `git fetch origin main` 失败：`RPC failed; curl 16 Error in the HTTP2 framing layer`、`fatal: expected flush after ref listing`。设置仓库级 `http.version=HTTP/1.1` 后重试，成功收到对象计数和部分解包进度，但 90 秒没有新输出，因此主动 `Ctrl+C`；此时没有更新 `origin/main` 或工作树。
+
+中断后的 `git cat-file` 显示目标提交对象 `c1cd94d` 已出现，祖先检查输出 `fast-forward-safe`；但 `git fsck --connectivity-only c1cd94d` 报告缺失 tree/blob，故没有在不完整对象图上执行 merge。这是预期的完整性保护，不是代码错误。
+
+### 受验证的 bundle 回退路径
+
+由于 Mac 本地与 GitHub 已在 `c1cd94d` 对齐，改用本地 Git 增量 bundle 规避服务器到 GitHub 的不稳定传输。Mac 上的命令与结果：
+
+```bash
+git bundle create /tmp/agent-badcase-dpo-c1cd94d.bundle adb596c..c1cd94d
+git bundle create /tmp/agent-badcase-dpo-c1cd94d.bundle c1cd94d ^adb596c
+git bundle create /tmp/agent-badcase-dpo-c1cd94d.bundle HEAD ^adb596c
+git bundle list-heads /tmp/agent-badcase-dpo-c1cd94d.bundle
+git bundle verify /tmp/agent-badcase-dpo-c1cd94d.bundle
+scp -P 24138 /tmp/agent-badcase-dpo-c1cd94d.bundle root@connect.cqa1.seetacloud.com:/root/autodl-tmp/agent-badcase-dpo-c1cd94d.bundle
+```
+
+前两条 bundle create 均返回 `fatal: Refusing to create empty bundle.`；改用 `HEAD ^adb596c` 后成功生成 49 KB bundle。验证结果：bundle 包含 `c1cd94d56c5b89ac9b1537a9bf99f382c8567b36 HEAD`，并要求已有基线 `adb596c3825394c9b67d64fcbf39cd2ab6148438`，SHA-1 bundle 完整。上传成功。
+
+服务器随后成功验证 bundle、以 Git fetch 更新 `origin/main`、通过 `git fsck --connectivity-only origin/main`，并 `git merge --ff-only origin/main`。最终结果：服务器 HEAD 和 `origin/main` 都是 `c1cd94d56c5b89ac9b1537a9bf99f382c8567b36`；工作区仍仅有 `?? vendor/`。快进带来第二轮配置、teacher、holdout、评测器、测试和文档；未触及任何被 Git 忽略的第一轮模型或实验产物。临时 bundle 暂保留在服务器 `/root/autodl-tmp/agent-badcase-dpo-c1cd94d.bundle`，未删除。
+
+本轮没有运行训练、服务、模型推理、数据重建或 GPU 命令。
