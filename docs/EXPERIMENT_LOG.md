@@ -611,3 +611,220 @@ history
 ```
 
 此命令的输出是附录 A 的原始依据。自此开始，后续每次服务器操作都必须在同一次实验日志更新中追加精确命令、参数、关键输出和状态。
+
+## 2026-09-02 / Run 7：网络切换后重连、服务器同步与校验
+
+### 时间与风险预评估
+
+开始前将后续工作分为两类：
+
+- 本次允许执行：重连、pull、代码/数据校验、vLLM 健康检查和 27 条 layered v2 采样，预计单项不超过 10 分钟。
+- 本次不启动：强模型合成、LLaMA-Factory 安装、DPO 训练与 merge；这些步骤合计可能需要 30-90 分钟，并受网络下载影响。
+
+断链预期：SSH 断开不会关闭 AutoDL 实例，实例仍保持运行和计费。`nohup ... &` 启动的 vLLM 应继续运行；普通前台采样或训练可能随终端断开而终止。
+
+### 实际连接事件
+
+切换本地网络后，旧 SSH 会话返回：
+
+```text
+Read from remote host: Connection reset by peer
+client_loop: send disconnect: Broken pipe
+```
+
+旧会话中刚发送的 pull/校验命令没有到达服务器 shell，因此不计入服务器命令账本。重新建立 SSH 后，AutoDL 欢迎信息报告 15 CPU cores、80 GB RAM、RTX 4090 D x1 和 170 GB 数据盘。
+
+### 服务器同步与校验命令
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+eval "$(conda shell.bash hook)"
+conda activate care-infer
+git status --short
+git rev-parse HEAD
+git pull --ff-only origin main
+git rev-parse HEAD
+python scripts/0_validate_tasks.py
+python -m unittest discover -s tests -v
+curl -sS http://127.0.0.1:8000/v1/models
+```
+
+### 关键输出
+
+```text
+git status --short: 无输出，tracked worktree clean
+pull 前 HEAD: 1f87b2a62183806e2ec180be54e1bccb7cf2aefb
+git pull: Fast-forward 1f87b2a..0454f39
+pull 后 HEAD: 0454f39796d296ac05263a1c0221dc5ad4fcde31
+
+任务总数: 24
+train/test: 15/9
+三类失效: 8/8/8
+任务字段、checker 引用与场景族隔离: 通过
+
+Ran 3 tests in 0.002s
+OK
+
+vLLM /v1/models: 成功返回 base
+max_model_len: 8192
+```
+
+### 状态判断
+
+- `SUCCESS`：服务器已部署 layered v2 修复和完整日志协议。
+- `SUCCESS`：3 个单测在服务器通过。
+- `SUCCESS`：vLLM 经历 SSH 断链后仍正常响应，后台服务不会因本地网络切换自动结束。
+- 下一步仍限定为短任务：使用新文件名执行 layered v2，保留 layered v1 原始结果。
+
+### A.12 重连后的服务器同步与校验
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+eval "$(conda shell.bash hook)"
+conda activate care-infer
+git status --short
+git rev-parse HEAD
+git pull --ff-only origin main
+git rev-parse HEAD
+python scripts/0_validate_tasks.py
+python -m unittest discover -s tests -v
+curl -sS http://127.0.0.1:8000/v1/models
+```
+
+## 2026-09-02 / Run 8：layered v2 重跑与暂停决策
+
+### 运行前时间评估
+
+- 27 条 layered v2 采样：预计 2-5 分钟，最坏预留 10 分钟。
+- 报告、行数和服务错误检查：预计 1 分钟。
+- 只读轨迹归因：预计 5 分钟以内。
+- 如果仍需修改上下文协议、校准任务并重跑三策略：预计 30-60 分钟，达到本次暂停阈值，不在本轮启动。
+
+### 采样与报告命令
+
+旧 `data/test_layered.jsonl` 作为 v1 失败证据保留。v2 使用新文件名：
+
+```bash
+test ! -e data/test_layered_v2.jsonl && echo "new output path confirmed"
+python3 scripts/1_run_baseline.py --split test --strategy layered --repeats 3 --temperature 0.2 --seed 42 --workers 4 --base-url http://127.0.0.1:8000/v1 --out data/test_layered_v2.jsonl
+python3 scripts/5_evaluate.py --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered_v2=data/test_layered_v2.jsonl --out results/context_compare_v2.md
+wc -l data/test_full.jsonl data/test_window.jsonl data/test_layered_v2.jsonl
+grep -n '"type": "error"' data/test_layered_v2.jsonl || true
+sed -n '1,220p' results/context_compare_v2.md
+```
+
+### 完整性与总体结果
+
+```text
+new output path confirmed
+full:       27 trajectories
+window:     27 trajectories
+layered_v2: 27 trajectories
+layered_v2 service/API errors: 0
+```
+
+| 策略 | 完成率 | 平均步数 | 平均 prompt 峰值 |
+|---|---:|---:|---:|
+| full | 11.1% (3/27) | 3.67 | 864 tokens |
+| window | 0.0% (0/27) | 3.74 | 868 tokens |
+| layered v1 | 3.7% (1/27) | 3.74 | 1,107 tokens |
+| layered v2 | 0.0% (0/27) | 2.96 | 894 tokens |
+
+layered v2 分类别完成率：
+
+```text
+tool_misuse:       0/9
+context_forgetting: 0/9
+planning_drift:    0/9
+```
+
+### 结果判断：`INVALID FOR POSITIVE CONTEXT CLAIM`
+
+修复达成了部分工程目标：平均 prompt 峰值从 v1 的 1,107 降到 894，接近 window 的 868，证明 v1 的重复上下文缺陷已经消除。但完成率下降为 0%，平均步骤降至 2.96，说明模型更频繁地提前终止。因此 v2 仍不能支持 structured/layered context 改善完成率的结论。
+
+### 只读 badcase 归因命令
+
+```bash
+python - <<'PY'
+import json
+from collections import Counter, defaultdict
+rows=[json.loads(line) for line in open('data/test_layered_v2.jsonl')]
+by=defaultdict(list)
+for row in rows:
+    by[row['task_id']].append(row)
+for task_id, group in sorted(by.items()):
+    sequences=Counter('>'.join(call['name'] for call in row['tool_calls']) or '<none>' for row in group)
+    print(task_id, f"ok={sum(row['success'] for row in group)}/3", f"avg_steps={sum(row['n_steps'] for row in group)/3:.2f}", dict(sequences))
+PY
+python - <<'PY'
+import json
+rows=[json.loads(line) for line in open('data/test_layered_v2.jsonl')]
+for row in rows:
+    print('\n', row['task_id'], row['repeat'], 'steps=', row['n_steps'], 'tokens=', row['max_prompt_tokens'])
+    print(' tools:', [(call['name'], call['args']) for call in row['tool_calls']])
+    print(' final:', row['final_answer'][:500].replace('\n', ' '))
+PY
+```
+
+### 按任务诊断
+
+| 任务 | v2 的稳定行为 | 主要失败 |
+|---|---|---|
+| `cf_test_001` | 3/3 只调用 `get_caregiver_permissions` | 用文本描述“接下来读取记录/时段”，但不继续调用工具 |
+| `cf_test_002` | 3/3 读偏好、学习历史并搜索材料 | 搜索后用文本描述将要发送，不调用 `send_voice_resource` |
+| `cf_test_003` | 3/3 完成三个读取 | 不创建提醒；appointment ID/时间仍含占位或错误值 |
+| `pd_test_001` | 2/3 只读来源，1/3 做到人工复测 | 未闭环到 `create_care_review` |
+| `pd_test_002` | 3/3 直接升级 | 未读问卷/档案，未调用 `log_safety_event` |
+| `pd_test_003` | 3/3 调用五个预期工具 | 工具参数使用虚构 case ID，最终答案未带真实 `ESC-924`/`SFU-924` |
+| `tm_test_001` | 3/3 直接配对 | 遗漏前置设备状态读取 |
+| `tm_test_002` | 3/3 直接升级 | 遗漏留言读取，priority 为 `high` 而非 `urgent` |
+| `tm_test_003` | 3/3 只查回电时段 | 用文本描述下一步，不调用 `create_callback_request` |
+
+核心失效不是 token 开销，而是模型在 tool observation 后把计划写成 final answer。layered v2 的 `system + state-as-user + latest assistant/tool` 组装虽然压缩了历史，但没有让 1.5B 模型稳定继续执行；当前 SYSTEM 中已有“达成目标后才最终作答”，仍不足以约束该模型。
+
+### 暂停决策
+
+下一步不能只改一个词后立即宣称成功，至少需要：
+
+1. 审计 layered 的消息角色和“未完成子目标”表达；
+2. 识别初始输入缺失必要 ID、工具 schema 要求与 checker 不一致的任务；
+3. 先用小 probe 校准 full 到约 30-50%；
+4. 所有策略使用同一校准任务集重新运行，不能只挑 layered 重跑；
+5. 在获得非地板基线前，不进入 preference synthesis 或 DPO。
+
+预计该链路需要 30-60 分钟，因此按用户的断链约束在此停止服务器实验。vLLM 继续以 nohup 后台运行；AutoDL 实例不会因 SSH 断开自动关闭，仍会运行和计费。生成的 v1/v2 JSONL 与报告保存在 `/root/autodl-tmp/agent-badcase-dpo/data` 和 `results` 中。
+
+### A.13 layered v2 采样、评测与完整性检查
+
+```bash
+test ! -e data/test_layered_v2.jsonl && echo "new output path confirmed"
+python3 scripts/1_run_baseline.py --split test --strategy layered --repeats 3 --temperature 0.2 --seed 42 --workers 4 --base-url http://127.0.0.1:8000/v1 --out data/test_layered_v2.jsonl
+python3 scripts/5_evaluate.py --files full=data/test_full.jsonl,window=data/test_window.jsonl,layered_v2=data/test_layered_v2.jsonl --out results/context_compare_v2.md
+wc -l data/test_full.jsonl data/test_window.jsonl data/test_layered_v2.jsonl
+grep -n '"type": "error"' data/test_layered_v2.jsonl || true
+sed -n '1,220p' results/context_compare_v2.md
+```
+
+### A.14 layered v2 轨迹诊断
+
+```bash
+python - <<'PY'
+import json
+from collections import Counter, defaultdict
+rows=[json.loads(line) for line in open('data/test_layered_v2.jsonl')]
+by=defaultdict(list)
+for row in rows:
+    by[row['task_id']].append(row)
+for task_id, group in sorted(by.items()):
+    sequences=Counter('>'.join(call['name'] for call in row['tool_calls']) or '<none>' for row in group)
+    print(task_id, f"ok={sum(row['success'] for row in group)}/3", f"avg_steps={sum(row['n_steps'] for row in group)/3:.2f}", dict(sequences))
+PY
+python - <<'PY'
+import json
+rows=[json.loads(line) for line in open('data/test_layered_v2.jsonl')]
+for row in rows:
+    print('\n', row['task_id'], row['repeat'], 'steps=', row['n_steps'], 'tokens=', row['max_prompt_tokens'])
+    print(' tools:', [(call['name'], call['args']) for call in row['tool_calls']])
+    print(' final:', row['final_answer'][:500].replace('\n', ' '))
+PY
+```
