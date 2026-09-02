@@ -1148,3 +1148,77 @@ To https://github.com/Macavity17/agent-badcase-dpo.git
 ```
 
 本次 GitHub 同步包含先前未推送的 2 个日志提交和本轮完整实验提交。`AGENTS.md`、`PROJECT_MEMORY.md`、本地凭据、AutoDL 原始 JSONL、模型和大型运行产物未进入 Git。
+
+## 2026-09-03 / Run 15：服务器工作区核验与三端代码对齐
+
+用户要求明确服务器实验代码、Mac 本地仓库和 GitHub 的关系，并要求直接完成安全的服务器对齐。该轮不使用真实凭据记录；SSH 连接参数为实例动态信息，未写入本日志。
+
+### 核验结论
+
+服务器原先的 Git `HEAD` 为 `0454f39`，但确实保留了用于最终实验的未提交工作区改动，而非用旧代码完成训练。逐文件内容哈希证明，服务器工作区中的以下实验核心文件与 GitHub 最终版完全一致：
+
+- `scripts/1_run_baseline.py`: `c046e9c613b21dda05e9456dd4dec35f97052029`
+- `scripts/3_build_preference.py`: `4957134d86ae262b76ee90ab34e9ea609a492a74`
+- `scripts/4_to_llamafactory.py`: `94c6bedaeffb425eba275141a94284a30d5d0ca4`
+- `tasks/tasks.jsonl`: `d4440c433ad447a4c2a5831e7ea704386f9db61a`
+- `tasks/dev_tasks.jsonl`: `4e01396b6bb24abaf75194126b7f34908db61591`
+
+服务器的 `tests/test_core.py` 仍是较早的 `84f28b3899cdf7db758699c1e045f86f949084c2`，最终版为 `9307ae672371af132f135280a85cdad99e069501`；README、实验指南、完整实验日志和 `scripts/5_evaluate.py` 也尚未同步到服务器。因此结论是：服务器直接运行了最终的核心实验代码，随后 Mac 将完整代码、补充测试和结果文档提交为 `a3eb5a5`，并继续提交同步记录为 `956780e`。
+
+### 服务器完整命令账本
+
+以下为本轮在服务器执行的全部 shell 命令，按执行顺序记录。第一组仅检查状态：
+
+```bash
+cd /root/autodl-tmp/agent-badcase-dpo
+git status --short
+git rev-parse HEAD
+git log --oneline -5
+git diff --stat
+git diff --name-status
+git diff --check
+```
+
+结果：tracked 改动为 `scripts/1_run_baseline.py`、`scripts/3_build_preference.py`、`scripts/4_to_llamafactory.py`、`tasks/tasks.jsonl`、`tests/test_core.py`，未跟踪项为 `tasks/dev_tasks.jsonl` 和 `vendor/`；HEAD 为 `0454f39`。`git diff --check` 无输出。
+
+随后拉取远程引用并比较对象，不修改工作区：
+
+```bash
+git fetch origin main
+git rev-parse origin/main
+git hash-object scripts/1_run_baseline.py scripts/3_build_preference.py scripts/4_to_llamafactory.py tasks/tasks.jsonl tests/test_core.py tasks/dev_tasks.jsonl
+git ls-tree origin/main -- scripts/1_run_baseline.py scripts/3_build_preference.py scripts/4_to_llamafactory.py tasks/tasks.jsonl tests/test_core.py tasks/dev_tasks.jsonl scripts/5_evaluate.py README.md docs/EXPERIMENT_GUIDE.md
+git diff --stat origin/main
+```
+
+`origin/main` 更新到 `956780eaa433c3710c83f2aaaf05d029db58588a`。上述哈希比较形成了前述结论；相对于最终版的其余差异为 README、指南、实验日志、`scripts/5_evaluate.py` 和补充测试。
+
+在覆盖受 Git 管理的工作区前，先将服务器 tracked diff 导出到数据盘。该补丁不含模型、JSONL、训练输出、证据包或未跟踪 `vendor/`：
+
+```bash
+test ! -e /root/autodl-tmp/server-worktree-before-sync-20260903.patch
+git diff --binary > /root/autodl-tmp/server-worktree-before-sync-20260903.patch
+sha256sum /root/autodl-tmp/server-worktree-before-sync-20260903.patch
+git reset --mixed origin/main
+git restore --source=origin/main --worktree .
+git rev-parse HEAD
+git status --short
+git diff --check
+python3 scripts/0_validate_tasks.py
+python3 -m unittest discover -s tests -v
+```
+
+补丁 SHA-256 为 `8337a826c7b3c7fc3619b18afc90ef3eba1a2e644cbe9897330878ff365e2bad`。`reset` 和 `restore` 后服务器 HEAD 成功成为 `956780e`，tracked 工作区干净，仅 `vendor/` 仍未跟踪。最后两条验证命令未运行成功，原因是默认服务器 shell 的 `python3` 不存在（`bash: python3: command not found`）；这是环境路径问题，不是代码或测试失败。
+
+改用已验证的推理 Conda 环境完成验证：
+
+```bash
+/root/miniconda3/envs/care-infer/bin/python --version
+/root/miniconda3/envs/care-infer/bin/python scripts/0_validate_tasks.py
+/root/miniconda3/envs/care-infer/bin/python -m unittest discover -s tests -v
+git diff --check
+git status --short
+git rev-parse HEAD
+```
+
+输出：Python `3.11.16`；24 个任务通过字段、checker 引用和场景族隔离校验；6 个单测全部通过；`git diff --check` 无输出；状态仅为 `?? vendor/`；HEAD 为 `956780eaa433c3710c83f2aaaf05d029db58588a`。至此，Mac、GitHub 与服务器的受 Git 管理代码对齐；服务器独有的模型、训练输出、原始 JSONL、证据包和 LLaMA-Factory `vendor/` 目录仍保留在服务器。
