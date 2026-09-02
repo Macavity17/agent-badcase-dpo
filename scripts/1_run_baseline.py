@@ -103,8 +103,8 @@ def apply_summary(messages, client, model, keep_rounds=2, compress_threshold=3):
     return messages[:2] + [summary_msg] + flat
 
 
-def build_state_block(task, steps_so_far):
-    """分层结构化的常驻状态块：目标/约束/已完成/关键观测。
+def build_state_block(task, compressed_steps):
+    """分层结构化的常驻状态块：目标/约束/早期步骤/关键观测。
 
     这一层是纯规则维护（不花模型调用、零成本、确定性强）——
     "该常驻的常驻，该滚动的滚动"。
@@ -115,25 +115,29 @@ def build_state_block(task, steps_so_far):
     if cons:
         lines.append("约束（必须遵守）:")
         lines += [f"  - {c}" for c in cons]
-    done = [s for s in steps_so_far if s.get("tool")]
+    done = [s for s in compressed_steps if s.get("tool")]
     if done:
-        lines.append("已完成步骤（不要重复）:")
+        lines.append("已压缩的早期步骤（不要重复）:")
         lines += [f"  {i+1}. {s['tool']}({json.dumps(s.get('args') or {}, ensure_ascii=False)})" for i, s in enumerate(done)]
-    obs = [s.get("observation", "") for s in steps_so_far if s.get("observation")]
+    obs = [s.get("observation", "") for s in compressed_steps if s.get("observation")]
     if obs:
-        lines.append("事件记忆（按发生顺序保留）:")
+        lines.append("早期事件记忆（按发生顺序保留）:")
         lines += [f"  - {o[:180]}" for o in obs]
     lines.append("=== 继续执行任务 ===")
     return "\n".join(lines)
 
 
-def apply_layered(messages, task, steps_so_far, keep_rounds=2):
-    """分层：常驻状态块（规则维护）+ 最近 2 轮细节。event-memory 思路。"""
+def apply_layered(messages, task, steps_so_far, keep_rounds=1):
+    """分层：稳定任务状态 + 压缩的早期记忆 + 最近一轮原始细节。"""
     pairs = _pair_up(messages)
     kept = pairs[-keep_rounds:]
     flat = [m for p in kept for m in p]
-    state = {"role": "system", "content": build_state_block(task, steps_so_far)}
-    return messages[:1] + [state] + messages[1:2] + flat
+    compressed_count = max(0, len(steps_so_far) - keep_rounds)
+    state = {
+        "role": "user",
+        "content": build_state_block(task, steps_so_far[:compressed_count]),
+    }
+    return messages[:1] + [state] + flat
 
 
 # ---------------- ReAct 主循环 ----------------
